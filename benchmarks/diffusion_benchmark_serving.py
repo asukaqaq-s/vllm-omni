@@ -41,6 +41,7 @@ import os
 import time
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -76,6 +77,9 @@ class RequestFuncOutput:
     start_time: float = 0.0
     response_body: dict[str, Any] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
+    measured_latency_s: float | None = None
+    slo_ms: float | None = None
+    slo_achieved: bool | None = None
 
 
 class BaseDataset(ABC):
@@ -551,6 +555,95 @@ class RandomDataset(BaseDataset):
         return [self[i] for i in range(len(self))]
 
 
+def _compute_slo_ms_from_base(req: RequestFuncInput, args, slo_base_time_ms: float | None) -> float | None:
+    """Compute SLO target based on a base per-step-per-frame unit time.
+
+    We assume linear scaling with pixel area, frame count, and num_inference_steps.
+    The base unit represents latency for a 16x16 resolution, single frame, single step.
+    """
+
+    if slo_base_time_ms is None:
+        return None
+
+    width = req.width if req.width is not None else args.width
+    height = req.height if req.height is not None else args.height
+    if width is None or height is None:
+        return None
+
+    frames = req.num_frames if req.num_frames is not None else args.num_frames
+    steps = req.num_inference_steps if req.num_inference_steps is not None else args.num_inference_steps
+
+    frame_scale = frames if isinstance(frames, int) and frames > 0 else 1
+    step_scale = steps if isinstance(steps, int) and steps > 0 else 1
+
+    area_units = max((float(width) * float(height)) / float(16 * 16), 1.0)
+    return float(slo_base_time_ms) * area_units * frame_scale * step_scale
+
+
+async def _infer_slo_base_time_ms(
+    args,
+    api_url: str,
+    model: str,
+    request_func,
+    session: aiohttp.ClientSession,
+) -> tuple[float | None, tuple[int, int] | None]:
+    """Send a small offline request to approximate the base SLO unit if unset.
+
+    Tries 256x256, 512x512, then 1024x1024. Returns per-unit (16x16, 1 frame, 1 step)
+    latency in milliseconds and the resolution used.
+    """
+
+    candidate_sizes = [(256, 256), (512, 512), (1024, 1024)]
+    frames = args.num_frames if args.num_frames is not None else 1
+    steps = args.num_inference_steps if args.num_inference_steps is not None else 1
+
+    for width, height in candidate_sizes:
+        sample_req = RequestFuncInput(
+            prompt="SLO calibration request",
+            api_url=api_url,
+            model=model,
+            width=width,
+            height=height,
+            num_frames=frames,
+            num_inference_steps=steps,
+            seed=args.seed,
+            fps=args.fps,
+        )
+        out = await request_func(sample_req, session, None)
+        if out.success and out.latency > 0:
+            area_units = max((float(width) * float(height)) / float(16 * 16), 1.0)
+            denom = area_units * max(frames, 1) * max(steps, 1)
+            base_ms = (out.latency * 1000.0) / denom if denom > 0 else None
+            if base_ms is not None:
+                return base_ms, (width, height)
+
+    return None, None
+
+
+async def iter_requests(
+    requests_list: list[RequestFuncInput],
+    request_rate: float,
+) -> AsyncGenerator[RequestFuncInput, None]:
+    """Yield requests using a fixed interval if request_rate is set.
+
+    - If request_rate is inf, all requests are yielded immediately (no sleep).
+    - Otherwise, requests are emitted at a fixed cadence of 1 / request_rate seconds.
+    """
+
+    if request_rate != float("inf"):
+        if request_rate <= 0:
+            raise ValueError(f"request_rate must be positive or inf, got {request_rate}.")
+        interval_s = 1.0 / float(request_rate)
+
+    for req in requests_list:
+        yield req
+
+        if request_rate == float("inf"):
+            continue
+
+        await asyncio.sleep(interval_s)
+
+
 def _guess_mime_type(path: str) -> str:
     mime, _ = mimetypes.guess_type(path)
     return mime or "application/octet-stream"
@@ -634,7 +727,14 @@ async def async_request_chat_completions(
     return output
 
 
-def calculate_metrics(outputs: list[RequestFuncOutput], total_duration: float):
+def calculate_metrics(
+    outputs: list[RequestFuncOutput],
+    total_duration: float,
+    requests_list: list[RequestFuncInput],
+    args,
+    slo_base_time_ms: float | None,
+    slo_enabled: bool,
+):
     success_outputs = [o for o in outputs if o.success]
     error_outputs = [o for o in outputs if not o.success]
 
@@ -655,6 +755,37 @@ def calculate_metrics(outputs: list[RequestFuncOutput], total_duration: float):
         "peak_memory_mb_mean": np.mean(peak_memories) if peak_memories else 0,
         "peak_memory_mb_median": np.median(peak_memories) if peak_memories else 0,
     }
+
+    if slo_enabled:
+        success_pairs: list[tuple[RequestFuncInput, RequestFuncOutput]] = [
+            (req, out) for req, out in zip(requests_list, outputs) if out.success
+        ]
+        slo_met_flags: list[bool] = []
+
+        for req, out in success_pairs:
+            out.measured_latency_s = out.latency
+            slo_ms = _compute_slo_ms_from_base(req, args, slo_base_time_ms)
+            out.slo_ms = slo_ms
+            if slo_ms is not None:
+                met = out.latency * 1000.0 <= slo_ms
+                out.slo_achieved = met
+                slo_met_flags.append(met)
+
+        slo_total = len(requests_list)
+        slo_defined_success = len(slo_met_flags)
+        slo_met_success = int(sum(1 for x in slo_met_flags if x))
+        slo_attain_success_only = (slo_met_success / slo_defined_success) if slo_defined_success > 0 else 0.0
+        slo_attain_all = slo_met_success / slo_total if slo_total > 0 else 0.0
+
+        metrics.update(
+            {
+                "slo_attainment_rate": slo_attain_all,
+                "slo_attainment_rate_success_only": slo_attain_success_only,
+                "slo_defined_success": slo_defined_success,
+                "slo_met_success": slo_met_success,
+                "slo_base_time_ms": slo_base_time_ms,
+            }
+        )
 
     return metrics
 
@@ -713,10 +844,28 @@ async def benchmark(args):
         else:
             return await request_func(req, session, pbar)
 
+    slo_base_time_ms = args.slo_base_time
+    slo_base_resolution = None
+
     # Run benchmark
     pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
 
     async with aiohttp.ClientSession() as session:
+        if args.slo and slo_base_time_ms is None:
+            print("Inferring SLO base unit via offline request (per 16x16 px, 1 frame, 1 step)...")
+            slo_base_time_ms, slo_base_resolution = await _infer_slo_base_time_ms(
+                args=args,
+                api_url=api_url,
+                model=args.model,
+                request_func=request_func,
+                session=session,
+            )
+            if slo_base_time_ms is not None:
+                res_str = f"{slo_base_resolution[0]}x{slo_base_resolution[1]}" if slo_base_resolution else "unknown"
+                print(f"Inferred SLO base time: {slo_base_time_ms:.2f} ms from {res_str} sample.")
+            else:
+                print("Failed to infer SLO base time; SLO metrics will be skipped unless provided.")
+
         if args.warmup_requests and requests_list:
             print(
                 f"Running {args.warmup_requests} warmup request(s) \
@@ -733,12 +882,7 @@ async def benchmark(args):
 
         start_time = time.perf_counter()
         tasks = []
-        for req in requests_list:
-            if args.request_rate != float("inf"):
-                # Poisson process: inter-arrival times follow exponential distribution
-                interval = np.random.exponential(1.0 / args.request_rate)
-                await asyncio.sleep(interval)
-
+        async for req in iter_requests(requests_list=requests_list, request_rate=args.request_rate):
             task = asyncio.create_task(limited_request_func(req, session, pbar))
             tasks.append(task)
 
@@ -748,7 +892,7 @@ async def benchmark(args):
     pbar.close()
 
     # Calculate metrics
-    metrics = calculate_metrics(outputs, total_duration)
+    metrics = calculate_metrics(outputs, total_duration, requests_list, args, slo_base_time_ms, args.slo)
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=60, c="="))
 
@@ -776,6 +920,24 @@ async def benchmark(args):
     print("{:<40} {:<15.4f}".format("Latency Mean (s):", metrics["latency_mean"]))
     print("{:<40} {:<15.4f}".format("Latency Median (s):", metrics["latency_median"]))
     print("{:<40} {:<15.4f}".format("Latency P99 (s):", metrics["latency_p99"]))
+
+    if args.slo:
+        print(f"{'-' * 50}")
+        print("{:<40} {:<15.2%}".format("SLO Attainment Rate (all):", metrics.get("slo_attainment_rate", 0.0)))
+        print(
+            "{:<40} {:<15.2%}".format(
+                "SLO Attainment Rate (success-only):",
+                metrics.get("slo_attainment_rate_success_only", 0.0),
+            )
+        )
+        print(
+            "{:<40} {:<15}".format(
+                "SLO evaluated (success count):",
+                f"{metrics.get('slo_met_success', 0)}/{metrics.get('slo_defined_success', 0)}",
+            )
+        )
+        if metrics.get("slo_base_time_ms"):
+            print("{:<40} {:<15.2f}".format("SLO base time (ms/unit):", float(metrics.get("slo_base_time_ms", 0.0))))
 
     if metrics["peak_memory_mb_max"] > 0:
         print(f"{'-' * 50}")
@@ -826,7 +988,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-concurrency",
         type=int,
-        default=1,
+        default=5,  ### 1
         help="Maximum number of concurrent requests, default to `1`. This can be used "
         "to help simulate an environment where a higher level component "
         "is enforcing a maximum number of concurrent requests. While the "
@@ -872,6 +1034,25 @@ if __name__ == "__main__":
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
     parser.add_argument("--output-file", type=str, default=None, help="Output JSON file for metrics.")
+    parser.add_argument(
+        "--slo",
+        action="store_true",
+        help=(
+            "Enable SLO calculation and reporting. SLO targets are derived from --slo-base-time "
+            "(per 16x16 px, one frame, one step). If not provided, a calibration request tries to "
+            "infer it assuming linear scaling by resolution, frames, and steps."
+        ),
+    )
+    parser.add_argument(
+        "--slo-base-time",
+        type=float,
+        default=None,
+        help=(
+            "Base latency in milliseconds for a 16x16 resolution, single-frame, single-step request "
+            "(roughly the minimal unit, typically ~= step_time * 3). Used to linearly scale SLO to "
+            "the actual resolution, frame count, and num_inference_steps."
+        ),
+    )
     parser.add_argument("--disable-tqdm", action="store_true", help="Disable progress bar.")
 
     args = parser.parse_args()
