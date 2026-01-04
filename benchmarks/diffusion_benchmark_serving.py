@@ -31,6 +31,7 @@ Usage:
 """
 
 import argparse
+import ast
 import asyncio
 import base64
 import glob
@@ -60,6 +61,8 @@ class RequestFuncInput:
     num_inference_steps: int | None = None
     seed: int | None = None
     fps: int | None = None
+    timestamp: float | None = None
+    slo_ms: float | None = None
     extra_body: dict[str, Any] = field(default_factory=dict)
     image_paths: list[str] | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -310,6 +313,217 @@ class VBenchDataset(BaseDataset):
         return [self[i] for i in range(len(self))]
 
 
+class TraceDataset(BaseDataset):
+    """Trace-based dataset loader for heterogeneous diffusion requests."""
+
+    DEFAULT_REPO_ID = "asukaqaqzz/Dit_Trace"
+    DEFAULT_FILENAME = "sd3_trace.txt"
+
+    def __init__(self, args, api_url: str, model: str):
+        super().__init__(args, api_url, model)
+        self.cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "vllm-omni", "trace")
+        dataset_root = args.dataset_path
+        if not dataset_root:
+            dataset_root = self._download_default_trace()
+        self.items = self._load_items(dataset_root)
+
+    @staticmethod
+    def _coerce_int(x: Any) -> int | None:
+        if x is None:
+            return None
+        if isinstance(x, bool):
+            return None
+        if isinstance(x, int):
+            return x
+        try:
+            s = str(x).strip()
+            if not s:
+                return None
+            return int(float(s))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _coerce_float(x: Any) -> float | None:
+        if x is None:
+            return None
+        if isinstance(x, float):
+            return x
+        if isinstance(x, int):
+            return float(x)
+        try:
+            s = str(x).strip()
+            if not s:
+                return None
+            return float(s)
+        except Exception:
+            return None
+
+    def _download_default_trace(self) -> str:
+        """Download default trace file from HuggingFace Hub if not provided."""
+
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as exc:
+            raise ImportError(
+                "huggingface_hub is required to download the default trace dataset. "
+                "Install via `pip install huggingface_hub`."
+            ) from exc
+
+        os.makedirs(self.cache_dir, exist_ok=True)
+        return hf_hub_download(
+            repo_id=self.DEFAULT_REPO_ID,
+            filename=self.DEFAULT_FILENAME,
+            repo_type="dataset",
+            local_dir=self.cache_dir,
+            local_dir_use_symlinks=False,
+        )
+
+    def _expand_paths(self, dataset_path: str | None) -> list[str]:
+        if not dataset_path:
+            return []
+
+        parts = [p.strip() for p in str(dataset_path).split(",") if p.strip()]
+        paths: list[str] = []
+        for p in parts:
+            if any(ch in p for ch in ["*", "?", "["]):
+                paths.extend(sorted(glob.glob(p)))
+            elif os.path.isdir(p):
+                paths.extend(sorted(glob.glob(os.path.join(p, "**", "*.txt"), recursive=True)))
+            else:
+                paths.append(p)
+
+        seen = set()
+        unique_paths = []
+        for p in paths:
+            if p not in seen:
+                seen.add(p)
+                unique_paths.append(p)
+        return unique_paths
+
+    def _parse_trace_file(self, path: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+
+        def parse_request_repr_line(line: str) -> dict[str, Any] | None:
+            text = line.strip()
+            if not text:
+                return None
+            if not (text.startswith("Request(") and text.endswith(")")):
+                return None
+            inner = text[len("Request(") : -1]
+            try:
+                expr = ast.parse(f"f({inner})", mode="eval")
+                if not isinstance(expr.body, ast.Call):
+                    return None
+                call = expr.body
+                out: dict[str, Any] = {}
+                for kw in call.keywords:
+                    if kw.arg is None:
+                        continue
+                    out[kw.arg] = ast.literal_eval(kw.value)
+                return out
+            except Exception:
+                return None
+
+        # detect first non-empty line to pick parser
+        first_non_empty = None
+        with open(path, encoding="utf-8") as f:
+            for _ in range(50):
+                pos = f.tell()
+                line = f.readline()
+                if not line:
+                    break
+                if line.strip():
+                    first_non_empty = line.strip()
+                    f.seek(pos)
+                    break
+
+        if first_non_empty is None:
+            return rows
+
+        if first_non_empty.startswith("Request("):
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    parsed = parse_request_repr_line(line)
+                    if isinstance(parsed, dict):
+                        rows.append(parsed)
+            return rows
+
+        # txt fallback: parse Request(...) lines only
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                parsed = parse_request_repr_line(line)
+                if isinstance(parsed, dict):
+                    rows.append(parsed)
+        return rows
+
+    def _load_items(self, dataset_root: str) -> list[dict[str, Any]]:
+        paths = self._expand_paths(dataset_root)
+        if not paths:
+            raise ValueError("No trace files found. Provide --dataset-path or rely on default HuggingFace download.")
+
+        items: list[dict[str, Any]] = []
+        for p in paths:
+            if not os.path.exists(p):
+                continue
+            for row in self._parse_trace_file(p):
+                if isinstance(row, dict):
+                    row = dict(row)
+                    row.setdefault("_source", p)
+                    items.append(row)
+
+        if not items:
+            raise ValueError("Trace dataset is empty after parsing provided paths.")
+
+        if self.args.num_prompts is not None:
+            items = items[: self.args.num_prompts]
+
+        return items
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> RequestFuncInput:
+        row = self.items[idx]
+        prompt = row.get("prompt") or row.get("text") or ""
+
+        row_height = self._coerce_int(row.get("height"))
+        row_width = self._coerce_int(row.get("width"))
+        num_frames = self._coerce_int(row.get("num_frames"))
+        num_steps = self._coerce_int(row.get("num_inference_steps"))
+        seed = self._coerce_int(row.get("seed"))
+        fps = self._coerce_int(row.get("fps"))
+        timestamp = self._coerce_float(row.get("timestamp"))
+        slo_ms = self._coerce_float(row.get("slo_ms"))
+
+        override_w = self.args.width
+        override_h = self.args.height
+        if override_w is not None or override_h is not None:
+            width = override_w
+            height = override_h
+        else:
+            width = row_width
+            height = row_height
+
+        return RequestFuncInput(
+            prompt=str(prompt),
+            api_url=self.api_url,
+            model=self.model,
+            width=width,
+            height=height,
+            num_frames=num_frames if num_frames is not None else self.args.num_frames,
+            num_inference_steps=num_steps if num_steps is not None else self.args.num_inference_steps,
+            seed=seed if seed is not None else self.args.seed,
+            fps=fps if fps is not None else self.args.fps,
+            timestamp=timestamp,
+            slo_ms=slo_ms,
+            request_id=str(row.get("request_id")) if row.get("request_id") is not None else str(uuid.uuid4()),
+        )
+
+    def get_requests(self) -> list[RequestFuncInput]:
+        return [self[i] for i in range(len(self))]
+
+
 class RandomDataset(BaseDataset):
     def __init__(self, args, api_url: str, model: str):
         self.args = args
@@ -475,6 +689,8 @@ async def benchmark(args):
 
     if args.dataset == "vbench":
         dataset = VBenchDataset(args, api_url, args.model)
+    elif args.dataset == "trace":
+        dataset = TraceDataset(args, api_url, args.model)
     elif args.dataset == "random":
         dataset = RandomDataset(args, api_url, args.model)
     else:
@@ -590,7 +806,7 @@ if __name__ == "__main__":
         "--dataset",
         type=str,
         default="vbench",
-        choices=["vbench", "random"],
+        choices=["vbench", "trace", "random"],
         help="Dataset to use.",
     )
     parser.add_argument(
