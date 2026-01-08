@@ -9,7 +9,7 @@ The main entrypoint is:
 
 - `benchmarks/diffusion/diffusion_benchmark_serving.py`
 
-## Quick Start
+## 1. Quick Start
 
 1. Start the server:
 
@@ -17,131 +17,37 @@ The main entrypoint is:
 vllm serve Qwen/Qwen-Image --omni --port 8099
 ```
 
-2. Run a small benchmark (trace dataset):
+2. Run a minimal benchmark:
 
 ```bash
 python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
 	--base-url http://localhost:8099 \
 	--model Qwen/Qwen-Image \
 	--task t2i \
-	--dataset trace \
-	--num-prompts 5 \
-	--request-rate 0.1 \
-	--max-concurrency 5 \
-	--slo \
-	--warmup-requests 2
+	--dataset vbench \
+	--num-prompts 5
 ```
 
-## Notes
+**Notes**
 
 - The benchmark talks to `http://<host>:<port>/v1/chat/completions`.
 - If you run the server on another host or port, pass `--base-url` accordingly.
 
-## Run the Benchmark
+## 2. Supported Datasets
 
-You can run the script either from the repo root or from the `benchmarks/` directory.
+The benchmark supports three dataset modes via `--dataset`:
 
-### Trace + SLO (recommended for SLO testing)
+- `vbench`: Built-in prompt/data loader.
+- `trace`: Heterogeneous request traces (each request can have different resolution/frames/steps).
+- `random`: Synthetic prompts for quick smoke tests.
 
-When testing SLO, avoid `--max-concurrency 1`.
-With a small concurrency limit, requests queue behind the semaphore and the achieved QPS may be
-lower than `--request-rate`, which will also skew SLO results.
+### VBench dataset
 
-Using more warmup requests can make the SLO estimation less noisy:
-
-```bash
-python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-	--base-url http://localhost:8099 \
-	--model Qwen/Qwen-Image \
-	--task t2i \
-	--dataset trace \
-	--num-prompts 5 \
-	--request-rate 0.1 \
-	--max-concurrency 5 \
-	--slo \
-	--warmup-requests 2
-```
-
-### VBench + SLO
-
-```bash
-python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-	--base-url http://localhost:8099 \
-	--dataset vbench \
-	--task t2i \
-	--num-prompts 10 \
-	--height 1024 \
-	--width 1024 \
-	--slo \
-	--max-concurrency 5 \
-	--request-rate 0.1
-```
-
-### Sweep QPS (SLO vs QPS)
-
-Example with higher QPS:
-
-```bash
-python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-	--base-url http://localhost:8099 \
-	--model Qwen/Qwen-Image \
-	--task t2i \
-	--dataset trace \
-	--num-prompts 5 \
-	--request-rate 1 \
-	--max-concurrency 5 \
-	--slo \
-	--warmup-requests 2
-```
-
-### VBench examples (built-in)
-
-The `vbench` dataset provides ready-to-use prompts for diffusion benchmarks.
-It supports text-to-video (`t2v`) and image-conditioned tasks (`i2v`, `i2i`).
-
-Text-to-video:
-
-```bash
-python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-	--dataset vbench --task t2v --num-prompts 10 \
-	--height 480 --width 640 --fps 16 --num-frames 80
-```
-
-Image-to-video:
-
-```bash
-python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-	--dataset vbench --task i2v --num-prompts 10
-```
-
-Text-to-image:
-
-```bash
-python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-	--dataset vbench --task t2i --num-prompts 10 \
-	--height 1024 --width 1024
-```
-
-Image-to-image:
-
-```bash
-python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-	--dataset vbench --task i2i --num-prompts 10
-```
-
-If you use i2v/i2i datasets and need auto-download support, you may need:
+If you use i2v/i2i bench datasets and need auto-download support, you may need:
 
 ```bash
 uv pip install gdown
 ```
-
-## 3) Supported Datasets
-
-The benchmark supports three dataset modes via `--dataset`:
-
-- `trace`: Heterogeneous request traces (each request can have different resolution/frames/steps).
-- `vbench`: VBench prompt/data loader.
-- `random`: Synthetic prompts for quick smoke tests.
 
 ### Trace dataset
 
@@ -157,74 +63,55 @@ By default (when `--dataset-path` is not provided), the script downloads a defau
 the HuggingFace dataset repo `asukaqaqzz/Dit_Trace`. The default filename can depend on `--task`
 (e.g., `t2v` uses a video trace).
 
+Current defaults:
+
+- `--task t2i` -> `sd3_trace.txt`
+- `--task t2v` -> `cogvideox_trace.txt`
+
 You can point to your own trace using `--dataset-path`.
 
-## 4) Important Arguments
+## 3. Benchmark Parameters
 
-This section highlights the most important knobs for interpreting results.
+### Basic flags
 
-### SLO (`--slo`, `--slo-scale`, warmup)
+- `--base-url`: Server address (the script calls `.../v1/chat/completions`).
+- `--model`: The OpenAI-compatible `model` field.
+- `--task`: Task type (e.g., `t2i`, `t2v`, `i2i`, `i2v`).
+- `--dataset`: Dataset mode (`vbench` / `trace` / `random`).
+- `--num-prompts`: Number of requests to send.
 
-When `--slo` is enabled:
+Common optional flags:
 
-- If the trace already contains `slo_ms` for a request, that value is used.
-- Otherwise, the script runs warmup requests and infers a base unit time, then estimates an SLO
-	for each request using a simple linear scaling model.
+- `--output-file`: Write metrics to a JSON file.
+- `--disable-tqdm`: Disable the progress bar.
 
-Warmup knobs:
+### Resolution / frames / steps: CLI defaults vs dataset fields
 
-- `--warmup-requests`: number of warmup requests to execute before measurement.
-- `--warmup-num-inference-steps`: the `num_inference_steps` used during warmup.
+Related flags: `--width`, `--height`, `--num-frames`, `--fps`, `--num-inference-steps`.
 
-Important:
+- For `vbench` / `random`: these CLI flags act as global defaults for all generated requests.
+- For `trace`: each request can carry its own fields (e.g., `width/height/num_frames/num_inference_steps`).
 
-- SLO estimation quality depends on warmup representativeness. If your workload has multiple
-	resolutions/steps/frames, increasing `--warmup-requests` can help.
-- For SLO-vs-QPS sweeps, set `--max-concurrency` high enough to avoid throttling. If concurrency
-	is too low, you will not actually hit the configured `--request-rate`.
+Precedence rules for `trace` (i.e., what actually gets sent):
 
+- `width/height`: if either `--width` or `--height` is explicitly set, it overrides per-request values from the trace; otherwise per-request values are used when present.
+- `num_frames`: per-request `num_frames` takes precedence; otherwise fall back to `--num-frames`.
+- `num_inference_steps`: per-request `num_inference_steps` takes precedence; otherwise fall back to `--num-inference-steps`.
 
-Where `--slo-scale` controls how strict the target is (default `3.0`).
+### SLO, warmup, and max concurrency
 
-### Traffic shaping (`--request-rate`, `--max-concurrency`)
+Enable SLO evaluation with `--slo`.
 
-- `--request-rate`: target request rate in requests/second.
-	- If it is `inf`, all requests are launched immediately.
-	- Otherwise, requests are emitted at a fixed cadence of $1 / \text{request\_rate}$ seconds.
+- If a request in the trace already has `slo_ms`, that value is used.
+- Otherwise, the script runs warmup requests to infer a base unit time, estimates `expected_ms` by linearly scaling with area/frames/steps, and then sets `slo_ms = expected_ms * --slo-scale`.
 
-- `--max-concurrency`: maximum number of in-flight requests allowed at once (default `1`).
-	This can *cap* the achieved request rate: if `--request-rate` is high but `--max-concurrency`
-	is low, requests will queue behind the concurrency limit and the achieved send rate may be
-	lower than the configured `--request-rate`.
+Warmup flags:
 
-Practical guidance:
+- `--warmup-requests`: Number of warmup requests.
+- `--warmup-num-inference-steps`: Steps used during warmup.
+- For `--task t2v`: warmup requests are forced to use `num_frames=1` to make warmup faster and less noisy.
 
-- To approximate the configured `--request-rate`, set `--max-concurrency` sufficiently large
-	for your model/latency (there is no `inf` value for this flag).
+Traffic / concurrency flags:
 
-### Resolution/frames/steps (`--width`, `--height`, `--num-frames`, `--num-inference-steps`)
-
-These flags can be used as global defaults (and also interact with the `trace` dataset):
-
-- `--width`, `--height`: image/video resolution.
-	- For `trace`: if either `--width` or `--height` is set, the script forces *all* requests to
-		use the CLI-provided values (overriding the per-request values from the trace).
-	- If they are not set, per-request `width/height` from the trace are used when available.
-
-- `--num-frames`:
-	- For `trace`: per-request `num_frames` (if present) takes precedence; otherwise it falls back
-		to the CLI `--num-frames`.
-
-- `--num-inference-steps`:
-	- For `trace`: per-request `num_inference_steps` (if present) takes precedence; otherwise it
-		falls back to the CLI `--num-inference-steps`.
-
-If you are using `vbench` or `random`, these flags act as global defaults for all requests
-constructed by that dataset loader.
-
-Other useful flags:
-
-- `--seed`: random seed (diffusion).
-- `--fps`: frames per second (video).
-- `--output-file`: write metrics JSON.
-- `--disable-tqdm`: disable progress bar.
+- `--request-rate`: Target request rate (requests/second). If set to `inf`, the script sends all requests immediately.
+- `--max-concurrency`: Max number of in-flight requests (default: `1`). This can hard-cap the achieved QPS: if it is too small, requests will queue behind the semaphore, and both achieved throughput and observed SLO attainment can be skewed.
