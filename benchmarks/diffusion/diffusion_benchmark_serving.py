@@ -320,10 +320,17 @@ class TraceDataset(BaseDataset):
 
     DEFAULT_REPO_ID = "asukaqaqzz/Dit_Trace"
     DEFAULT_FILENAME = "sd3_trace.txt"
+    DEFAULT_FILENAME_BY_TASK: dict[str, str] = {
+        # Text-to-image traces (e.g., SD3)
+        "t2i": "sd3_trace.txt",
+        # Text-to-video traces (e.g., CogVideoX)
+        "t2v": "cogvideox_trace.txt",
+    }
 
     def __init__(self, args, api_url: str, model: str):
         super().__init__(args, api_url, model)
         self.cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "vllm-omni", "trace")
+        self.default_filename = self.DEFAULT_FILENAME_BY_TASK.get(getattr(args, "task", ""), self.DEFAULT_FILENAME)
         dataset_root = args.dataset_path
         if not dataset_root:
             dataset_root = self._download_default_trace()
@@ -375,7 +382,7 @@ class TraceDataset(BaseDataset):
         os.makedirs(self.cache_dir, exist_ok=True)
         return hf_hub_download(
             repo_id=self.DEFAULT_REPO_ID,
-            filename=self.DEFAULT_FILENAME,
+            filename=self.default_filename,
             repo_type="dataset",
             local_dir=self.cache_dir,
             local_dir_use_symlinks=False,
@@ -650,16 +657,7 @@ def _populate_slo_ms_from_warmups(
         if req.slo_ms is not None:
             updated.append(req)
             continue
-        print(f"base_time_ms inferred from warmups: {base_time_ms:.2f} ms")
         expected_ms = _compute_expected_latency_ms_from_base(req, args, base_time_ms)
-        print(
-            "Setting SLO for request_id={} to {:.2f} ms (expected {:.2f} ms * scale {:.2f})".format(
-                req.request_id if hasattr(req, "request_id") else "unknown",
-                (expected_ms * slo_scale) if expected_ms is not None else float("nan"),
-                expected_ms if expected_ms is not None else float("nan"),
-                slo_scale,
-            )
-        )
         updated.append(replace(req, slo_ms=(expected_ms * slo_scale) if expected_ms is not None else None))
 
     return updated
@@ -1039,7 +1037,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-inference-steps",
         type=int,
-        default=None,
+        default=50,
         help="Number of inference steps (for diffusion models).",
     )
     parser.add_argument(
