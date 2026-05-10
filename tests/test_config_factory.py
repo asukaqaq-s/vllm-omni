@@ -941,6 +941,27 @@ class TestDeployConfigLoading:
         assert stages[1].yaml_runtime["devices"] == "1,2"
         assert stages[1].yaml_runtime["num_replicas"] == 2
 
+    def test_merge_pipeline_deploy_maps_diffusion_submodule(self):
+        from vllm_omni.config.stage_config import DeployConfig, merge_pipeline_deploy
+
+        pipeline = PipelineConfig(
+            model_type="qwen_image_3stage",
+            model_arch="QwenImagePipeline",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="encode",
+                    execution_type=StageExecutionType.DIFFUSION_SUBMODULE,
+                ),
+            ),
+        )
+
+        stages = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))
+
+        assert stages[0].stage_type == StageType.DIFFUSION
+        assert stages[0].worker_type == "submodule"
+        assert stages[0].scheduler_cls is None
+
 
 class TestQwen3OmniPipeline:
     def test_registered(self):
