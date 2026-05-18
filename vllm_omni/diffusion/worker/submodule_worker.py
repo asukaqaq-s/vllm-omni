@@ -97,7 +97,9 @@ class SubModuleWorker:
             enable_return_routed_experts=False,
         )
         vllm_config.quant_config = self.od_config.quantization_config
-        vllm_config.kernel_config.ir_op_priority = current_omni_platform.get_default_ir_op_priority(vllm_config)
+        get_ir_op_priority = getattr(current_omni_platform, "get_default_ir_op_priority", None)
+        if callable(get_ir_op_priority):
+            vllm_config.kernel_config.ir_op_priority = get_ir_op_priority(vllm_config)
         self.vllm_config = vllm_config
 
         with (
@@ -144,6 +146,11 @@ class SubModuleWorker:
         """Execute one submodule request and return a submodule-shaped output."""
         assert self.model_runner is not None, "Model runner not initialized"
         return self.model_runner.execute_model(req)
+
+    def execute_submodule_batch(self, reqs: list[OmniDiffusionRequest]) -> list[DiffusionOutput]:
+        """Execute a batch of submodule requests."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        return self.model_runner.execute_model_batch(reqs)
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if self.od_config.enable_sleep_mode:

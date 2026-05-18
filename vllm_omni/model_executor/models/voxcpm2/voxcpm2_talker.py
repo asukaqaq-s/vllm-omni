@@ -23,7 +23,10 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, override_forward_context
-from vllm.inputs import tokens_input
+try:
+    from vllm.inputs import tokens_input
+except ImportError:
+    from vllm.inputs.data import token_inputs as tokens_input
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,

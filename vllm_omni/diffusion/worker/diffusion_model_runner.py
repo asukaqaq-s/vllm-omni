@@ -355,6 +355,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
     def _prepare_batch_inputs(self, states: list[DiffusionRequestState], new_request_ids: list[str]) -> InputBatch:
         # process new reqs
+        new_states: list[DiffusionRequestState] = []
         for state in states:
             if state.req_id in new_request_ids:
                 # set generator
@@ -366,7 +367,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     else:
                         gen_device = self.device
                     state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
+                new_states.append(state)
+
+        if new_states:
+            prepare_encode_batch = getattr(self.pipeline, "prepare_encode_batch", None)
+            if callable(prepare_encode_batch):
+                prepare_encode_batch(new_states)
+            else:
                 # encode
+                for state in new_states:
+                    self.pipeline.prepare_encode(state)
+
+        for state in new_states:
+            if state.latents is None:
                 self.pipeline.prepare_encode(state)
 
         input_batch = InputBatch.make_batch(

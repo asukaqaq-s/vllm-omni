@@ -43,15 +43,25 @@ class _PendingSubModuleRequest:
     request_id: str
     request: OmniDiffusionRequest
     future: Future
+    result_index: int = 0
     aborted: bool = False
+
+
+@dataclass
+class _QueuedSubModuleRequest:
+    request_id: str
+    prompts: list[Any]
+    sampling_params_dict: dict[str, Any]
 
 
 class StageSubModuleProc:
     """Owns one lightweight submodule worker and serves ZMQ requests."""
 
-    def __init__(self, model: str, od_config: OmniDiffusionConfig) -> None:
+    def __init__(self, model: str, od_config: OmniDiffusionConfig, batch_size: int = 1) -> None:
         del model
         self._od_config = od_config
+        self._batch_size = max(1, int(batch_size or 1))
+        self._batch_wait_s = 0.005
         self._worker: SubModuleWorker | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._closed = False
@@ -66,9 +76,10 @@ class StageSubModuleProc:
         self._worker.load_model(load_format=self._od_config.diffusion_load_format)
         self._executor = ThreadPoolExecutor(max_workers=1)
         logger.info(
-            "StageSubModuleProc initialized with model=%s stage=%s",
+            "StageSubModuleProc initialized with model=%s stage=%s batch_size=%d",
             self._od_config.model,
             self._od_config.model_stage,
+            self._batch_size,
         )
 
     @staticmethod
@@ -82,28 +93,63 @@ class StageSubModuleProc:
 
         return OmniDiffusionSamplingParams(**sampling_params_dict)
 
-    def _submit_stage_request(
+    def _submit_stage_batch(
         self,
-        request_id: str,
-        prompts: list[Any],
-        sampling_params_dict: dict[str, Any],
-    ) -> _PendingSubModuleRequest:
+        queued_requests: list[_QueuedSubModuleRequest],
+    ) -> list[_PendingSubModuleRequest]:
         assert self._worker is not None
         assert self._executor is not None
-        if len(prompts) != 1:
-            raise ValueError(f"StageSubModuleProc only supports one prompt per request, got {len(prompts)}.")
-        sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
-        request = OmniDiffusionRequest(
-            prompts=prompts,
-            sampling_params=sampling_params,
-            request_ids=[request_id] * len(prompts),
-        )
-        future = self._executor.submit(self._worker.execute_submodule, request)
-        return _PendingSubModuleRequest(
-            request_id=request_id,
-            request=request,
-            future=future,
-        )
+        requests: list[OmniDiffusionRequest] = []
+        for queued in queued_requests:
+            if len(queued.prompts) != 1:
+                raise ValueError(
+                    f"StageSubModuleProc only supports one prompt per request, got {len(queued.prompts)}."
+                )
+            sampling_params = self._reconstruct_sampling_params(dict(queued.sampling_params_dict))
+            requests.append(
+                OmniDiffusionRequest(
+                    prompts=queued.prompts,
+                    sampling_params=sampling_params,
+                    request_ids=[queued.request_id] * len(queued.prompts),
+                )
+            )
+
+        future = self._executor.submit(self._worker.execute_submodule_batch, requests)
+        return [
+            _PendingSubModuleRequest(
+                request_id=queued.request_id,
+                request=request,
+                future=future,
+                result_index=index,
+            )
+            for index, (queued, request) in enumerate(zip(queued_requests, requests, strict=True))
+        ]
+
+    @staticmethod
+    def _has_active_request(pending_requests: dict[str, _PendingSubModuleRequest]) -> bool:
+        return any(not pending.future.done() for pending in pending_requests.values())
+
+    def _maybe_submit_ready_batch(
+        self,
+        ready_requests: list[_QueuedSubModuleRequest],
+        ready_since: float | None,
+        pending_requests: dict[str, _PendingSubModuleRequest],
+        *,
+        force: bool = False,
+    ) -> float | None:
+        if not ready_requests or self._has_active_request(pending_requests):
+            return ready_since
+
+        waited_long_enough = ready_since is not None and (time.monotonic() - ready_since) >= self._batch_wait_s
+        if not force and len(ready_requests) < self._batch_size and not waited_long_enough:
+            return ready_since
+
+        batch = ready_requests[: self._batch_size]
+        pendings = self._submit_stage_batch(batch)
+        del ready_requests[: len(batch)]
+        for pending in pendings:
+            pending_requests[pending.request_id] = pending
+        return time.monotonic() if ready_requests else None
 
     def _build_outputs(
         self,
@@ -169,7 +215,8 @@ class StageSubModuleProc:
             if pending.aborted:
                 continue
             try:
-                output = pending.future.result()
+                outputs = pending.future.result()
+                output = outputs[pending.result_index]
                 if output.error:
                     await response_socket.send(
                         encoder.encode({"type": "error", "request_id": request_id, "error": output.error})
@@ -211,6 +258,8 @@ class StageSubModuleProc:
         encoder = OmniMsgpackEncoder()
         decoder = OmniMsgpackDecoder()
         pending_requests: dict[str, _PendingSubModuleRequest] = {}
+        ready_requests: list[_QueuedSubModuleRequest] = []
+        ready_since: float | None = None
         poller = zmq.asyncio.Poller()
         poller.register(request_socket, zmq.POLLIN)
         shutdown_requested = False
@@ -229,36 +278,36 @@ class StageSubModuleProc:
                         msg_type = msg.get("type")
                         if msg_type == "add_request":
                             request_id = msg["request_id"]
-                            try:
-                                pending_requests[request_id] = self._submit_stage_request(
+                            ready_requests.append(
+                                _QueuedSubModuleRequest(
                                     request_id,
                                     [msg["prompt"]],
                                     msg["sampling_params"],
                                 )
-                            except Exception as exc:
-                                logger.exception("Submodule request %s failed to submit: %s", request_id, exc)
-                                await response_socket.send(
-                                    encoder.encode({"type": "error", "request_id": request_id, "error": str(exc)})
-                                )
+                            )
+                            if ready_since is None:
+                                ready_since = time.monotonic()
                         elif msg_type == "add_batch_request":
                             request_id = msg["request_id"]
-                            try:
-                                pending_requests[request_id] = self._submit_stage_request(
+                            ready_requests.append(
+                                _QueuedSubModuleRequest(
                                     request_id,
                                     msg["prompts"],
                                     msg["sampling_params"],
                                 )
-                            except Exception as exc:
-                                logger.exception("Batch submodule request %s failed to submit: %s", request_id, exc)
-                                await response_socket.send(
-                                    encoder.encode({"type": "error", "request_id": request_id, "error": str(exc)})
-                                )
+                            )
+                            if ready_since is None:
+                                ready_since = time.monotonic()
                         elif msg_type == "abort":
-                            for rid in msg.get("request_ids", []):
+                            abort_ids = set(msg.get("request_ids", []))
+                            if abort_ids:
+                                ready_requests[:] = [
+                                    queued for queued in ready_requests if queued.request_id not in abort_ids
+                                ]
+                            for rid in abort_ids:
                                 pending = pending_requests.get(rid)
                                 if pending is not None:
                                     pending.aborted = True
-                                    pending.future.cancel()
                         elif msg_type == "collective_rpc":
                             rpc_id = msg["rpc_id"]
                             try:
@@ -281,6 +330,22 @@ class StageSubModuleProc:
                             break
 
                 await self._drain_completed_requests(pending_requests, response_socket, encoder)
+                try:
+                    ready_since = self._maybe_submit_ready_batch(
+                        ready_requests,
+                        ready_since,
+                        pending_requests,
+                        force=shutdown_requested,
+                    )
+                except Exception as exc:
+                    failed = ready_requests[: self._batch_size]
+                    del ready_requests[: self._batch_size]
+                    ready_since = time.monotonic() if ready_requests else None
+                    logger.exception("Submodule batch failed to submit: %s", exc)
+                    for queued in failed:
+                        await response_socket.send(
+                            encoder.encode({"type": "error", "request_id": queued.request_id, "error": str(exc)})
+                        )
         finally:
             request_socket.close()
             response_socket.close()
@@ -303,6 +368,7 @@ class StageSubModuleProc:
         cls,
         model: str,
         od_config: OmniDiffusionConfig,
+        batch_size: int,
         handshake_address: str,
         request_address: str,
         response_address: str,
@@ -319,7 +385,7 @@ class StageSubModuleProc:
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
-        proc = cls(model, od_config)
+        proc = cls(model, od_config, batch_size=batch_size)
         try:
             proc.initialize()
             handshake_ctx = zmq.Context()
@@ -342,6 +408,7 @@ class StageSubModuleProc:
 def spawn_submodule_proc(
     model: str,
     od_config: OmniDiffusionConfig,
+    batch_size: int = 1,
 ) -> tuple[BaseProcess, str, str, str]:
     handshake_address = get_open_zmq_ipc_path()
     request_address = get_open_zmq_ipc_path()
@@ -354,6 +421,7 @@ def spawn_submodule_proc(
         kwargs={
             "model": model,
             "od_config": od_config,
+            "batch_size": batch_size,
             "handshake_address": handshake_address,
             "request_address": request_address,
             "response_address": response_address,

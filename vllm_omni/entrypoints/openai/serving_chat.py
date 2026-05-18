@@ -2677,11 +2677,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 created=created_time,
                 model=self._diffusion_model_name,
                 choices=[choice],
-                usage=UsageInfo(
-                    prompt_tokens=len(prompt.split()),
-                    completion_tokens=1,
-                    total_tokens=len(prompt.split()) + 1,
-                ),
+                usage={
+                    "prompt_tokens": len(prompt.split()),
+                    "completion_tokens": 1,
+                    "total_tokens": len(prompt.split()) + 1,
+                },
             )
 
             logger.info(

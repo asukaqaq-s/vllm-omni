@@ -73,39 +73,20 @@ class VAEModelRunner:
             mem.consumed_memory / GiB_bytes,
         )
 
-    def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
-        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
-        if not req.prompts:
-            raise ValueError("Cannot execute VAE runner on an empty request.")
-
-        stage = getattr(self.od_config, "model_stage", None)
-        if stage not in ("encode", "decode"):
-            raise ValueError(f"VAEModelRunner requires model_stage encode/decode, got {stage!r}.")
-
+    def _ensure_generator(self, req: OmniDiffusionRequest) -> None:
         sampling = req.sampling_params
-        if sampling.generator is None and sampling.seed is not None:
-            if sampling.generator_device is not None:
-                gen_device = sampling.generator_device
-            elif self.device.type == "cpu":
-                gen_device = "cpu"
-            else:
-                gen_device = self.device
-            sampling.generator = torch.Generator(device=gen_device).manual_seed(sampling.seed)
+        if sampling.generator is not None or sampling.seed is None:
+            return
+        if sampling.generator_device is not None:
+            gen_device = sampling.generator_device
+        elif self.device.type == "cpu":
+            gen_device = "cpu"
+        else:
+            gen_device = self.device
+        sampling.generator = torch.Generator(device=gen_device).manual_seed(sampling.seed)
 
-        with torch.inference_mode():
-            with set_forward_context(
-                vllm_config=self.vllm_config,
-                omni_diffusion_config=self.od_config,
-            ):
-                if stage == "encode":
-                    results = self.pipeline.execute_encode([req])
-                else:
-                    results = self.pipeline.execute_decode([req])
-
-        if not results:
-            return DiffusionOutput(error=f"{stage} stage returned no outputs")
-
-        stage_out = results[0]
+    @staticmethod
+    def _stage_result_to_output(stage: str, stage_out: Any) -> DiffusionOutput:
         stage_items = stage_out.items() if isinstance(stage_out, dict) else vars(stage_out).items()
         payload = {k: v for k, v in stage_items if k != "req_id" and v is not None and not (k == "metadata" and not v)}
 
@@ -113,3 +94,37 @@ class VAEModelRunner:
             return DiffusionOutput(output=payload.get("image"), multimodal_output=payload)
 
         return DiffusionOutput(output=None, multimodal_output=payload)
+
+    def execute_model_batch(self, reqs: list[OmniDiffusionRequest]) -> list[DiffusionOutput]:
+        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        if not reqs:
+            return []
+
+        stage = getattr(self.od_config, "model_stage", None)
+        if stage not in ("encode", "decode"):
+            raise ValueError(f"VAEModelRunner requires model_stage encode/decode, got {stage!r}.")
+
+        for req in reqs:
+            if not req.prompts:
+                raise ValueError("Cannot execute VAE runner on an empty request.")
+            self._ensure_generator(req)
+
+        with torch.inference_mode():
+            with set_forward_context(
+                vllm_config=self.vllm_config,
+                omni_diffusion_config=self.od_config,
+            ):
+                if stage == "encode":
+                    results = self.pipeline.execute_encode(reqs)
+                else:
+                    results = self.pipeline.execute_decode(reqs)
+
+        if not results:
+            return [DiffusionOutput(error=f"{stage} stage returned no outputs") for _ in reqs]
+        if len(results) != len(reqs):
+            raise RuntimeError(f"{stage} stage returned {len(results)} outputs for {len(reqs)} requests.")
+
+        return [self._stage_result_to_output(stage, stage_out) for stage_out in results]
+
+    def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        return self.execute_model_batch([req])[0]

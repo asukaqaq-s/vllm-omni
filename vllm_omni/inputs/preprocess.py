@@ -1,7 +1,12 @@
 from typing import Any
 
 from typing_extensions import assert_never
-from vllm.inputs import EmbedsInput, MultiModalInput, SingletonInput
+try:
+    from vllm.inputs import EmbedsInput, MultiModalInput, SingletonInput
+except ImportError:
+    from vllm.inputs import EmbedsInputs as EmbedsInput
+    from vllm.inputs import SingletonInputs as SingletonInput
+    from vllm.inputs.data import MultiModalInputs as MultiModalInput
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.renderers.inputs import SingletonDictPrompt

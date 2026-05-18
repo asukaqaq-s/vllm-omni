@@ -18,6 +18,49 @@ Architecture:
 # throw in patch if the versions differ.
 from .version import __version__, __version_tuple__  # isort:skip # noqa: F401
 
+
+def _apply_vllm_inputs_compat() -> None:
+    """Expose renamed vLLM input helpers when running against older vLLM."""
+    try:
+        import sys
+        import types
+
+        import vllm.inputs as inputs
+        from vllm.inputs import data
+    except ModuleNotFoundError:
+        return
+
+    aliases = {
+        "TokensInput": getattr(data, "TokensInput", getattr(data, "TokenInputs", dict)),
+        "SingletonInput": getattr(data, "SingletonInput", getattr(data, "SingletonInputs", dict)),
+        "EmbedsInput": getattr(data, "EmbedsInput", getattr(data, "EmbedsInputs", dict)),
+        "MultiModalInput": getattr(data, "MultiModalInput", getattr(data, "MultiModalInputs", dict)),
+        "MultiModalDataDict": getattr(data, "MultiModalDataDict", dict),
+        "ModalityData": getattr(data, "ModalityData", object),
+        "tokens_input": getattr(data, "tokens_input", getattr(data, "token_inputs", None)),
+    }
+    for name, value in aliases.items():
+        if value is not None and not hasattr(inputs, name):
+            setattr(inputs, name, value)
+
+    engine_mod = sys.modules.get("vllm.inputs.engine")
+    if engine_mod is None:
+        engine_mod = types.ModuleType("vllm.inputs.engine")
+        sys.modules["vllm.inputs.engine"] = engine_mod
+    for name, value in aliases.items():
+        if value is not None and not hasattr(engine_mod, name):
+            setattr(engine_mod, name, value)
+
+    llm_mod = sys.modules.get("vllm.inputs.llm")
+    if llm_mod is None:
+        llm_mod = types.ModuleType("vllm.inputs.llm")
+        sys.modules["vllm.inputs.llm"] = llm_mod
+    if not hasattr(llm_mod, "MultiModalDataDict"):
+        llm_mod.MultiModalDataDict = aliases["MultiModalDataDict"]
+
+
+_apply_vllm_inputs_compat()
+
 try:
     from . import patch  # noqa: F401
 except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency

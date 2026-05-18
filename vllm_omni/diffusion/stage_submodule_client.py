@@ -56,7 +56,12 @@ class StageSubModuleClient:
         self.custom_process_input_func = getattr(metadata, "custom_process_input_func", None)
         self.engine_input_source = getattr(metadata, "engine_input_source", [])
 
-        proc, handshake_address, request_address, response_address = spawn_submodule_proc(model, od_config)
+        self._batch_size = max(1, int(batch_size or 1))
+        proc, handshake_address, request_address, response_address = spawn_submodule_proc(
+            model,
+            od_config,
+            batch_size=self._batch_size,
+        )
         complete_submodule_handshake(proc, handshake_address, stage_init_timeout)
         self._proc = proc
 
@@ -79,7 +84,7 @@ class StageSubModuleClient:
             self.stage_id,
             self.replica_id,
             getattr(od_config, "model_stage", None),
-            batch_size,
+            self._batch_size,
         )
 
     def _drain_responses(self) -> None:

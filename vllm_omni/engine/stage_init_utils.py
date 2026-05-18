@@ -896,6 +896,19 @@ def build_diffusion_config(
     return od_config
 
 
+def get_stage_max_num_seqs(stage_cfg: Any, default: int = 1) -> int:
+    engine_args = getattr(stage_cfg, "engine_args", {})
+    value = (
+        engine_args.get("max_num_seqs")
+        if hasattr(engine_args, "get")
+        else getattr(engine_args, "max_num_seqs", None)
+    )
+    try:
+        return max(1, int(value if value is not None else default))
+    except (TypeError, ValueError):
+        return max(1, int(default))
+
+
 def initialize_diffusion_stage(
     stage_id: int,
     model: str,
@@ -923,11 +936,15 @@ def initialize_diffusion_stage(
     if getattr(stage_cfg, "worker_type", None) == "submodule":
         from vllm_omni.diffusion.stage_submodule_client import StageSubModuleClient
 
+        submodule_batch_size = max(
+            max(1, int(batch_size or 1)),
+            get_stage_max_num_seqs(stage_cfg, default=1),
+        )
         return StageSubModuleClient(
             model,
             od_config,
             metadata,
             stage_init_timeout=stage_init_timeout,
-            batch_size=batch_size,
+            batch_size=submodule_batch_size,
         )
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)

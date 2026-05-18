@@ -24,6 +24,9 @@ def validate_prompt_sequence_lengths(
     if length_offset:
         sequence_lengths = sequence_lengths - length_offset
     sequence_lengths = torch.clamp(sequence_lengths, min=0)
+    # Keep this validation on CPU. Some Ascend torch_npu builds can return
+    # invalid indices for nonzero() on an all-false NPU boolean tensor.
+    sequence_lengths = sequence_lengths.detach().to("cpu")
     too_long = torch.nonzero(sequence_lengths > max_sequence_length, as_tuple=False)
     if too_long.numel() == 0:
         return

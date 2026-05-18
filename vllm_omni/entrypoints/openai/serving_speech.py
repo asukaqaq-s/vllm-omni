@@ -24,7 +24,10 @@ from vllm.entrypoints.openai.engine.protocol import (
     RequestResponseMetadata,
 )
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
-from vllm.inputs import tokens_input
+try:
+    from vllm.inputs import tokens_input
+except ImportError:
+    from vllm.inputs.data import token_inputs as tokens_input
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector
 from vllm.utils import random_uuid

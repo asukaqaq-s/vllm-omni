@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import copy
 import json
 import time
 from pathlib import Path
@@ -452,22 +453,29 @@ def main():
         extra_args["lora_request"] = lora_request
         extra_args["lora_scale"] = args.lora_scale
 
+    sampling_params = OmniDiffusionSamplingParams(
+        height=args.height,
+        width=args.width,
+        generator=generator,
+        true_cfg_scale=args.cfg_scale,
+        guidance_scale=args.guidance_scale,
+        guidance_scale_2=args.guidance_scale_2,
+        num_inference_steps=args.num_inference_steps,
+        num_outputs_per_prompt=args.num_images_per_prompt,
+        extra_args=extra_args,
+    )
+    sampling_params_list = (
+        sampling_params
+        if omni.num_stages == 1
+        else [copy.deepcopy(sampling_params) for _ in range(omni.num_stages)]
+    )
+
     outputs = omni.generate(
         {
             "prompt": args.prompt,
             "negative_prompt": args.negative_prompt,
         },
-        OmniDiffusionSamplingParams(
-            height=args.height,
-            width=args.width,
-            generator=generator,
-            true_cfg_scale=args.cfg_scale,
-            guidance_scale=args.guidance_scale,
-            guidance_scale_2=args.guidance_scale_2,
-            num_inference_steps=args.num_inference_steps,
-            num_outputs_per_prompt=args.num_images_per_prompt,
-            extra_args=extra_args,
-        ),
+        sampling_params_list,
     )
 
     generation_end = time.perf_counter()

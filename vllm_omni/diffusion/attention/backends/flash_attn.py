@@ -54,6 +54,38 @@ class FlashAttentionImpl(AttentionImpl):
         # FA3 may return (out, lse), FA2 returns out
         return out[0] if isinstance(out, tuple) else out
 
+    @staticmethod
+    def _reshape_npu_attn_mask(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Normalize masks for Ascend FlashAttentionScore."""
+        if attention_mask is None:
+            return None
+
+        # Skip all-valid masks, matching the SDPA backend optimization.
+        if torch.all(attention_mask != 0):
+            return None
+
+        if (
+            attention_mask.ndim == 2
+            and attention_mask.shape[0] == query.shape[0]
+            and attention_mask.shape[1] == key.shape[1]
+        ):
+            batch_size = int(attention_mask.shape[0])
+            query_length = int(query.shape[1])
+            key_length = int(key.shape[1])
+            return (
+                attention_mask.to(torch.bool)
+                .unsqueeze(1)
+                .unsqueeze(2)
+                .expand(batch_size, 1, query_length, key_length)
+                .contiguous()
+            )
+
+        return attention_mask.to(torch.bool).contiguous()
+
     def _forward_varlen_masked(
         self,
         query: torch.Tensor,
@@ -230,6 +262,7 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
+        attention_mask = self._reshape_npu_attn_mask(query, key, attention_mask)
         output = attention_forward(
             query,
             key,

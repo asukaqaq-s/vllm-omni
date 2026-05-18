@@ -505,8 +505,12 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
 
     def _extract_masked_hidden(self, hidden_states: torch.Tensor, mask: torch.Tensor):
         bool_mask = mask.bool()
-        valid_lengths = bool_mask.sum(dim=1)
+        valid_lengths = bool_mask.detach().to("cpu").sum(dim=1)
         selected = hidden_states[bool_mask]
+        if int(valid_lengths.sum().item()) != int(selected.shape[0]) and mask.shape[0] == 1:
+            # Ascend SP can leave a local attention mask that does not round-trip
+            # correctly to CPU, while the boolean selection itself is valid.
+            valid_lengths = torch.tensor([selected.shape[0]], dtype=torch.long)
         split_result = torch.split(selected, valid_lengths.tolist(), dim=0)
 
         return split_result
@@ -530,7 +534,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             padding=True,
             truncation=False,
             return_tensors="pt",
-        ).to(self.device)
+        )
         # Validate only the user prompt contribution. The Qwen template also
         # adds a fixed suffix after the user text, so subtracting only
         # prompt_template_encode_start_idx would overcount near-limit prompts.
@@ -539,7 +543,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             padding=True,
             truncation=False,
             return_tensors="pt",
-        ).to(self.device)
+        )
         validate_prompt_sequence_lengths(
             txt_tokens.attention_mask,
             max_sequence_length=max_sequence_length or self.tokenizer_max_length,
@@ -548,6 +552,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             baseline_attention_mask=template_tokens.attention_mask,
             error_context="after applying the Qwen prompt template",
         )
+        txt_tokens = txt_tokens.to(self.device)
         encoder_hidden_states = self.text_encoder(
             input_ids=txt_tokens.input_ids,
             attention_mask=txt_tokens.attention_mask,
@@ -904,6 +909,146 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
 
         return state
 
+    def _full_diffusion_batch_key(self, state: "DiffusionRequestState", **kwargs: Any) -> tuple[Any, ...] | None:
+        """Return a compatibility key for batching stepwise encode setup."""
+        if kwargs.get("attention_kwargs"):
+            return None
+        sampling = state.sampling
+        num_images_per_prompt = sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
+        if num_images_per_prompt != 1 or sampling.latents is not None:
+            return None
+
+        prompt, negative_prompt = self._extract_prompts(state.prompts or [])
+        if prompt is None or len(prompt) != 1:
+            return None
+        has_negative_prompt = negative_prompt is not None
+        if has_negative_prompt and len(negative_prompt) != 1:
+            return None
+
+        generator = sampling.generator
+        if isinstance(generator, list) and len(generator) != 1:
+            return None
+
+        height = sampling.height or self.default_sample_size * self.vae_scale_factor
+        width = sampling.width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = sampling.num_inference_steps or 50
+        true_cfg_scale = sampling.true_cfg_scale or 4.0
+        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 1.0
+        return (
+            int(height),
+            int(width),
+            int(num_inference_steps),
+            self._sigmas_key(sampling.sigmas),
+            float(guidance_scale),
+            float(true_cfg_scale),
+            int(sampling.max_sequence_length or self.tokenizer_max_length),
+            bool(has_negative_prompt),
+        )
+
+    def _prepare_full_diffusion_states_batch(
+        self,
+        states: list["DiffusionRequestState"],
+        **kwargs: Any,
+    ) -> list["DiffusionRequestState"]:
+        """Batch the text encoder/latent setup for compatible new requests."""
+        if len(states) == 1:
+            return [self._prepare_full_diffusion_state(states[0], **kwargs)]
+
+        sampling = states[0].sampling
+        height = sampling.height or self.default_sample_size * self.vae_scale_factor
+        width = sampling.width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = sampling.num_inference_steps or 50
+        true_cfg_scale = sampling.true_cfg_scale or 4.0
+        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 1.0
+        max_sequence_length = sampling.max_sequence_length or self.tokenizer_max_length
+
+        prompts: list[str] = []
+        negative_prompts: list[str] = []
+        has_negative_prompt = False
+        generators: list[torch.Generator] = []
+        use_generator_list = True
+        for state in states:
+            prompt, negative_prompt = self._extract_prompts(state.prompts or [])
+            prompts.append(prompt[0])
+            if negative_prompt is None:
+                negative_prompts.append("")
+            else:
+                has_negative_prompt = True
+                negative_prompts.append(negative_prompt[0])
+
+            generator = state.sampling.generator
+            if isinstance(generator, list):
+                generator = generator[0] if len(generator) == 1 else None
+            if generator is None:
+                use_generator_list = False
+            else:
+                generators.append(generator)
+
+        ctx = self._prepare_generation_context(
+            prompt=prompts,
+            negative_prompt=negative_prompts if has_negative_prompt else None,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            sigmas=sampling.sigmas,
+            guidance_scale=guidance_scale,
+            num_images_per_prompt=1,
+            generator=generators if use_generator_list else None,
+            true_cfg_scale=true_cfg_scale,
+            max_sequence_length=max_sequence_length,
+            attention_kwargs=kwargs.get("attention_kwargs"),
+        )
+
+        for index, state in enumerate(states):
+            req_scheduler = copy.deepcopy(self.scheduler)
+            req_scheduler.set_begin_index(0)
+
+            state.prompt_embeds = self._slice_batch_tensor(ctx["prompt_embeds"], index)
+            state.prompt_embeds_mask = self._slice_batch_tensor(ctx["prompt_embeds_mask"], index)
+            state.negative_prompt_embeds = self._slice_batch_tensor(ctx["negative_prompt_embeds"], index)
+            state.negative_prompt_embeds_mask = self._slice_batch_tensor(ctx["negative_prompt_embeds_mask"], index)
+            state.latents = self._slice_batch_tensor(ctx["latents"], index)
+            state.timesteps = ctx["timesteps"]
+            state.step_index = 0
+            state.scheduler = req_scheduler
+            state.do_true_cfg = ctx["do_true_cfg"]
+            state.guidance = self._slice_batch_tensor(ctx["guidance"], index)
+            state.img_shapes = self._slice_batch_list(ctx["img_shapes"], index)
+            state.txt_seq_lens = self._slice_batch_list(ctx["txt_seq_lens"], index)
+            state.negative_txt_seq_lens = self._slice_batch_list(ctx["negative_txt_seq_lens"], index)
+            state.sampling.cfg_normalize = True
+
+        return states
+
+    def prepare_encode_batch(
+        self,
+        states: list["DiffusionRequestState"],
+        **kwargs: Any,
+    ) -> list["DiffusionRequestState"]:
+        if not states:
+            return states
+        if os.environ.get("VLLM_OMNI_DISABLE_QWEN_IMAGE_ENCODE_BATCH", "").lower() in {"1", "true", "yes"}:
+            for state in states:
+                self.prepare_encode(state, **kwargs)
+            return states
+        if self.stage != "diffusion":
+            for state in states:
+                self.prepare_encode(state, **kwargs)
+            return states
+
+        groups: dict[tuple[Any, ...], list[int]] = {}
+        for index, state in enumerate(states):
+            key = self._full_diffusion_batch_key(state, **kwargs)
+            if key is None:
+                self._prepare_full_diffusion_state(state, **kwargs)
+            else:
+                groups.setdefault(key, []).append(index)
+
+        for indices in groups.values():
+            batch_states = [states[index] for index in indices]
+            self._prepare_full_diffusion_states_batch(batch_states, **kwargs)
+        return states
+
     def _prepare_denoise_stage_state(
         self,
         state: "DiffusionRequestState",
@@ -1147,6 +1292,172 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
 
         return self._decode_latents(state.latents, height, width, output_type)
 
+    @staticmethod
+    def _slice_batch_tensor(value: torch.Tensor | None, index: int) -> torch.Tensor | None:
+        if value is None:
+            return None
+        return value[index : index + 1]
+
+    @staticmethod
+    def _slice_batch_list(value: list[Any] | None, index: int) -> list[Any] | None:
+        if value is None:
+            return None
+        return value[index : index + 1]
+
+    @staticmethod
+    def _sigmas_key(sigmas: list[float] | None) -> tuple[float, ...] | None:
+        if sigmas is None:
+            return None
+        return tuple(float(x) for x in sigmas)
+
+    def _encode_batch_key(self, req: OmniDiffusionRequest) -> tuple[Any, ...] | None:
+        sampling = req.sampling_params
+        num_images_per_prompt = sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
+        if len(req.prompts or []) != 1 or num_images_per_prompt != 1:
+            return None
+
+        prompt, negative_prompt = self._extract_prompts(req.prompts)
+        if prompt is None or len(prompt) != 1:
+            return None
+        if negative_prompt is not None and len(negative_prompt) != 1:
+            return None
+
+        generator = sampling.generator
+        if isinstance(generator, list) and len(generator) != 1:
+            return None
+
+        height = sampling.height or self.default_sample_size * self.vae_scale_factor
+        width = sampling.width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = sampling.num_inference_steps or 50
+        true_cfg_scale = sampling.true_cfg_scale or 4.0
+        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 1.0
+        return (
+            int(height),
+            int(width),
+            int(num_inference_steps),
+            self._sigmas_key(sampling.sigmas),
+            float(guidance_scale),
+            float(true_cfg_scale),
+            int(sampling.max_sequence_length or self.tokenizer_max_length),
+        )
+
+    def _execute_encode_one(self, req: OmniDiffusionRequest) -> dict[str, Any]:
+        sampling = req.sampling_params
+        prompt, negative_prompt = self._extract_prompts(req.prompts)
+        height = sampling.height or self.default_sample_size * self.vae_scale_factor
+        width = sampling.width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = sampling.num_inference_steps or 50
+        true_cfg_scale = sampling.true_cfg_scale or 4.0
+        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 1.0
+        num_images_per_prompt = sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
+
+        ctx = self._prepare_generation_context(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            sigmas=sampling.sigmas,
+            guidance_scale=guidance_scale,
+            num_images_per_prompt=num_images_per_prompt,
+            generator=sampling.generator,
+            true_cfg_scale=true_cfg_scale,
+            max_sequence_length=sampling.max_sequence_length or self.tokenizer_max_length,
+        )
+        return {
+            "context": ctx["prompt_embeds"],
+            "context_mask": ctx["prompt_embeds_mask"],
+            "context_null": ctx["negative_prompt_embeds"],
+            "context_null_mask": ctx["negative_prompt_embeds_mask"],
+            "latents": ctx["latents"],
+            "timesteps": ctx["timesteps"],
+            "sigmas": sampling.sigmas,
+            "num_inference_steps": num_inference_steps,
+            "height": height,
+            "width": width,
+            "img_shapes": ctx["img_shapes"],
+            "guidance": ctx["guidance"],
+            "guidance_scale": guidance_scale,
+            "true_cfg_scale": true_cfg_scale,
+            "do_true_cfg": ctx["do_true_cfg"],
+            "txt_seq_lens": ctx["txt_seq_lens"],
+            "negative_txt_seq_lens": ctx["negative_txt_seq_lens"],
+        }
+
+    def _execute_encode_batch(self, requests: list[OmniDiffusionRequest]) -> list[dict[str, Any]]:
+        if len(requests) == 1:
+            return [self._execute_encode_one(requests[0])]
+
+        sampling = requests[0].sampling_params
+        height = sampling.height or self.default_sample_size * self.vae_scale_factor
+        width = sampling.width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = sampling.num_inference_steps or 50
+        true_cfg_scale = sampling.true_cfg_scale or 4.0
+        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 1.0
+        max_sequence_length = sampling.max_sequence_length or self.tokenizer_max_length
+
+        prompts: list[str] = []
+        negative_prompts: list[str] = []
+        has_negative_prompt = False
+        generators: list[torch.Generator] = []
+        use_generator_list = True
+        for req in requests:
+            prompt, negative_prompt = self._extract_prompts(req.prompts)
+            prompts.append(prompt[0])
+            if negative_prompt is None:
+                negative_prompts.append("")
+            else:
+                has_negative_prompt = True
+                negative_prompts.append(negative_prompt[0])
+
+            generator = req.sampling_params.generator
+            if isinstance(generator, list):
+                generator = generator[0] if len(generator) == 1 else None
+            if generator is None:
+                use_generator_list = False
+            else:
+                generators.append(generator)
+
+        ctx = self._prepare_generation_context(
+            prompt=prompts,
+            negative_prompt=negative_prompts if has_negative_prompt else None,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            sigmas=sampling.sigmas,
+            guidance_scale=guidance_scale,
+            num_images_per_prompt=1,
+            generator=generators if use_generator_list else None,
+            true_cfg_scale=true_cfg_scale,
+            max_sequence_length=max_sequence_length,
+        )
+
+        outputs: list[dict[str, Any]] = []
+        for index, req in enumerate(requests):
+            req_sampling = req.sampling_params
+            outputs.append(
+                {
+                    "context": self._slice_batch_tensor(ctx["prompt_embeds"], index),
+                    "context_mask": self._slice_batch_tensor(ctx["prompt_embeds_mask"], index),
+                    "context_null": self._slice_batch_tensor(ctx["negative_prompt_embeds"], index),
+                    "context_null_mask": self._slice_batch_tensor(ctx["negative_prompt_embeds_mask"], index),
+                    "latents": self._slice_batch_tensor(ctx["latents"], index),
+                    "timesteps": ctx["timesteps"],
+                    "sigmas": req_sampling.sigmas,
+                    "num_inference_steps": num_inference_steps,
+                    "height": height,
+                    "width": width,
+                    "img_shapes": self._slice_batch_list(ctx["img_shapes"], index),
+                    "guidance": self._slice_batch_tensor(ctx["guidance"], index),
+                    "guidance_scale": guidance_scale,
+                    "true_cfg_scale": true_cfg_scale,
+                    "do_true_cfg": ctx["do_true_cfg"],
+                    "txt_seq_lens": self._slice_batch_list(ctx["txt_seq_lens"], index),
+                    "negative_txt_seq_lens": self._slice_batch_list(ctx["negative_txt_seq_lens"], index),
+                }
+            )
+        return outputs
+
     def execute_encode(self, requests: list[OmniDiffusionRequest]) -> list[dict[str, Any]]:
         """Run QwenImage text/latent preparation for the encode submodule stage."""
         if self.stage != "encode":
@@ -1154,49 +1465,90 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         if self.text_encoder is None or self.tokenizer is None:
             raise RuntimeError("encode stage requires text_encoder and tokenizer loaded.")
 
-        outputs: list[dict[str, Any]] = []
-        for req in requests:
-            sampling = req.sampling_params
-            prompt, negative_prompt = self._extract_prompts(req.prompts)
-            height = sampling.height or self.default_sample_size * self.vae_scale_factor
-            width = sampling.width or self.default_sample_size * self.vae_scale_factor
-            num_inference_steps = sampling.num_inference_steps or 50
-            true_cfg_scale = sampling.true_cfg_scale or 4.0
-            guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 1.0
-            num_images_per_prompt = sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
+        outputs: list[dict[str, Any] | None] = [None] * len(requests)
+        groups: dict[tuple[Any, ...], list[int]] = {}
+        for index, req in enumerate(requests):
+            key = self._encode_batch_key(req)
+            if key is None:
+                outputs[index] = self._execute_encode_one(req)
+            else:
+                groups.setdefault(key, []).append(index)
 
-            ctx = self._prepare_generation_context(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                sigmas=sampling.sigmas,
-                guidance_scale=guidance_scale,
-                num_images_per_prompt=num_images_per_prompt,
-                generator=sampling.generator,
-                true_cfg_scale=true_cfg_scale,
-                max_sequence_length=sampling.max_sequence_length or self.tokenizer_max_length,
-            )
+        for indices in groups.values():
+            batch_reqs = [requests[index] for index in indices]
+            batch_outputs = self._execute_encode_batch(batch_reqs)
+            for index, output in zip(indices, batch_outputs, strict=True):
+                outputs[index] = output
+
+        if any(output is None for output in outputs):
+            raise RuntimeError("QwenImage encode batching left missing outputs.")
+        return [output for output in outputs if output is not None]
+
+    def _decode_batch_key(self, req: OmniDiffusionRequest) -> tuple[Any, ...] | None:
+        if len(req.prompts or []) != 1:
+            return None
+        info = self._stage_payload_from_prompts(req.prompts)
+        latents = info["latents"]
+        if not torch.is_tensor(latents) or latents.ndim == 0 or latents.shape[0] != 1:
+            return None
+        sampling = req.sampling_params
+        height = info["height"] or sampling.height
+        width = info["width"] or sampling.width
+        output_type = info.get("output_type") or getattr(sampling, "output_type", None) or "pil"
+        return (
+            int(height),
+            int(width),
+            str(output_type),
+            tuple(int(x) for x in latents.shape[1:]),
+            str(latents.dtype),
+        )
+
+    def _execute_decode_one(self, req: OmniDiffusionRequest, post_process) -> dict[str, Any]:
+        sampling = req.sampling_params
+        info = self._stage_payload_from_prompts(req.prompts)
+        latents = info["latents"]
+        if torch.is_tensor(latents):
+            latents = latents.to(self.device).contiguous()
+        height = info["height"] or sampling.height
+        width = info["width"] or sampling.width
+        output_type = info.get("output_type") or getattr(sampling, "output_type", None) or "pil"
+        image = self._decode_latents(latents, height, width, output_type).output
+        if post_process is not None and output_type != "latent":
+            image = post_process(image)
+        return {
+            "image": image,
+            "output_type": output_type,
+        }
+
+    def _execute_decode_batch(self, requests: list[OmniDiffusionRequest], post_process) -> list[dict[str, Any]]:
+        if len(requests) == 1:
+            return [self._execute_decode_one(requests[0], post_process)]
+
+        first_info = self._stage_payload_from_prompts(requests[0].prompts)
+        first_sampling = requests[0].sampling_params
+        height = first_info["height"] or first_sampling.height
+        width = first_info["width"] or first_sampling.width
+        output_type = first_info.get("output_type") or getattr(first_sampling, "output_type", None) or "pil"
+        latents = [
+            self._stage_payload_from_prompts(req.prompts)["latents"].to(self.device).contiguous() for req in requests
+        ]
+        batched_latents = torch.cat(latents, dim=0)
+        images = self._decode_latents(batched_latents, height, width, output_type).output
+        if post_process is not None and output_type != "latent":
+            images = post_process(images)
+
+        outputs: list[dict[str, Any]] = []
+        for index in range(len(requests)):
+            if torch.is_tensor(images):
+                image = images[index : index + 1]
+            elif isinstance(images, list):
+                image = images[index]
+            else:
+                image = images
             outputs.append(
                 {
-                    "context": ctx["prompt_embeds"],
-                    "context_mask": ctx["prompt_embeds_mask"],
-                    "context_null": ctx["negative_prompt_embeds"],
-                    "context_null_mask": ctx["negative_prompt_embeds_mask"],
-                    "latents": ctx["latents"],
-                    "timesteps": ctx["timesteps"],
-                    "sigmas": sampling.sigmas,
-                    "num_inference_steps": num_inference_steps,
-                    "height": height,
-                    "width": width,
-                    "img_shapes": ctx["img_shapes"],
-                    "guidance": ctx["guidance"],
-                    "guidance_scale": guidance_scale,
-                    "true_cfg_scale": true_cfg_scale,
-                    "do_true_cfg": ctx["do_true_cfg"],
-                    "txt_seq_lens": ctx["txt_seq_lens"],
-                    "negative_txt_seq_lens": ctx["negative_txt_seq_lens"],
+                    "image": image,
+                    "output_type": output_type,
                 }
             )
         return outputs
@@ -1209,26 +1561,24 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             raise RuntimeError("decode stage requires VAE loaded.")
 
         post_process = get_qwen_image_post_process_func(self.od_config)
-        outputs: list[dict[str, Any]] = []
-        for req in requests:
-            sampling = req.sampling_params
-            info = self._stage_payload_from_prompts(req.prompts)
-            latents = info["latents"]
-            if torch.is_tensor(latents):
-                latents = latents.to(self.device).contiguous()
-            height = info["height"] or sampling.height
-            width = info["width"] or sampling.width
-            output_type = info.get("output_type") or getattr(sampling, "output_type", None) or "pil"
-            image = self._decode_latents(latents, height, width, output_type).output
-            if post_process is not None and output_type != "latent":
-                image = post_process(image)
-            outputs.append(
-                {
-                    "image": image,
-                    "output_type": output_type,
-                }
-            )
-        return outputs
+        outputs: list[dict[str, Any] | None] = [None] * len(requests)
+        groups: dict[tuple[Any, ...], list[int]] = {}
+        for index, req in enumerate(requests):
+            key = self._decode_batch_key(req)
+            if key is None:
+                outputs[index] = self._execute_decode_one(req, post_process)
+            else:
+                groups.setdefault(key, []).append(index)
+
+        for indices in groups.values():
+            batch_reqs = [requests[index] for index in indices]
+            batch_outputs = self._execute_decode_batch(batch_reqs, post_process)
+            for index, output in zip(indices, batch_outputs, strict=True):
+                outputs[index] = output
+
+        if any(output is None for output in outputs):
+            raise RuntimeError("QwenImage decode batching left missing outputs.")
+        return [output for output in outputs if output is not None]
 
     @staticmethod
     def _stage_payload_from_prompts(prompts: list[Any] | None) -> dict[str, Any]:
