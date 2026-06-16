@@ -891,6 +891,181 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
+    def _build_dynamic_denoise_kwargs(
+        self,
+        input_batch: "InputBatch",
+        *,
+        branch: str,
+    ) -> dict[str, Any]:
+        if input_batch.packed_latents is None or input_batch.img_seq_lens is None:
+            raise ValueError("Dynamic Qwen-Image denoise requires packed latents.")
+
+        latents = input_batch.packed_latents
+        device = latents.device
+        dtype = latents.dtype
+        timestep = input_batch.timesteps.to(device=device, dtype=dtype).reshape(input_batch.num_reqs) / 1000
+        guidance = None if input_batch.guidance is None else input_batch.guidance.to(device=device, dtype=dtype)
+
+        if branch == "negative":
+            encoder_hidden_states = input_batch.negative_prompt_embeds
+            encoder_hidden_states_mask = input_batch.negative_prompt_embeds_mask
+            txt_seq_lens = input_batch.negative_txt_seq_lens
+        else:
+            encoder_hidden_states = input_batch.prompt_embeds
+            encoder_hidden_states_mask = input_batch.prompt_embeds_mask
+            txt_seq_lens = input_batch.txt_seq_lens
+
+        if encoder_hidden_states is None:
+            raise ValueError(f"Dynamic Qwen-Image {branch} branch is missing prompt embeddings.")
+
+        attention_kwargs = dict(self.attention_kwargs)
+        attention_kwargs["attention_id"] = f"qwen_image.joint.{branch}"
+
+        return {
+            "hidden_states": latents,
+            "timestep": timestep,
+            "guidance": guidance,
+            "encoder_hidden_states": encoder_hidden_states,
+            "encoder_hidden_states_mask": encoder_hidden_states_mask,
+            "img_shapes": input_batch.img_shapes,
+            "img_seq_lens": input_batch.img_seq_lens,
+            "txt_seq_lens": txt_seq_lens,
+            "attention_kwargs": attention_kwargs,
+            "return_dict": False,
+        }
+
+    @staticmethod
+    def _expect_dynamic_noise(
+        noise_pred: Any,
+        *,
+        branch: str,
+        img_seq_lens: list[int],
+    ) -> torch.Tensor:
+        if not torch.is_tensor(noise_pred):
+            raise ValueError(f"Dynamic Qwen-Image {branch} branch must return a tensor.")
+        if noise_pred.ndim != 2:
+            raise ValueError(f"Dynamic Qwen-Image {branch} branch must return packed tensor.")
+        return noise_pred
+
+    def combine_cfg(
+        self,
+        positive_noise_pred: torch.Tensor,
+        negative_noise_pred: torch.Tensor,
+        input_batch: "InputBatch",
+    ) -> torch.Tensor:
+        """Combine packed positive/negative noise with request-local CFG.
+
+        vLLM-style stage helper for the Qwen-Image packed dynamic path: reads
+        per-request ``img_seq_lens`` / ``true_cfg_scales`` / ``cfg_normalize_flags``
+        from ``input_batch`` and applies a request-local scale via ``token_to_req``.
+        Numerically identical to the historical ``_combine_dynamic_cfg``.
+        """
+        return self._combine_dynamic_cfg(
+            positive_noise_pred,
+            negative_noise_pred,
+            input_batch.img_seq_lens,
+            input_batch.true_cfg_scales,
+            input_batch.cfg_normalize_flags,
+        )
+
+    def _combine_dynamic_cfg(
+        self,
+        positive_noise_pred: torch.Tensor,
+        negative_noise_pred: torch.Tensor,
+        img_seq_lens: list[int],
+        true_cfg_scales: list[float],
+        cfg_normalize_flags: list[bool],
+    ) -> torch.Tensor:
+        if positive_noise_pred.shape != negative_noise_pred.shape:
+            raise ValueError("Dynamic Qwen-Image CFG branch outputs have different shapes.")
+        if len(true_cfg_scales) != len(img_seq_lens):
+            raise ValueError("Dynamic Qwen-Image CFG scales do not match request count.")
+
+        token_to_req = torch.repeat_interleave(
+            torch.arange(len(img_seq_lens), dtype=torch.long, device=positive_noise_pred.device),
+            torch.tensor(img_seq_lens, dtype=torch.long, device=positive_noise_pred.device),
+        )
+        scales = torch.tensor(true_cfg_scales, dtype=positive_noise_pred.dtype, device=positive_noise_pred.device)
+        noise_pred = negative_noise_pred + scales.index_select(0, token_to_req).unsqueeze(-1) * (
+            positive_noise_pred - negative_noise_pred
+        )
+        if not any(cfg_normalize_flags):
+            return noise_pred
+
+        positive_parts = torch.split(positive_noise_pred, img_seq_lens, dim=0)
+        noise_parts = torch.split(noise_pred, img_seq_lens, dim=0)
+        combined_parts = []
+        for positive, noise, normalize in zip(positive_parts, noise_parts, cfg_normalize_flags, strict=True):
+            if normalize:
+                noise = self.cfg_normalize_function(positive, noise)
+            combined_parts.append(noise)
+        return torch.cat(combined_parts, dim=0)
+
+    def _combine_dense_cfg(
+        self,
+        positive_noise_pred: torch.Tensor,
+        negative_noise_pred: torch.Tensor,
+        input_batch: "InputBatch",
+    ) -> torch.Tensor:
+        if positive_noise_pred.shape != negative_noise_pred.shape:
+            raise ValueError("Dense Qwen-Image CFG branch outputs have different shapes.")
+
+        row_to_req = torch.repeat_interleave(
+            torch.arange(input_batch.num_reqs, dtype=torch.long, device=positive_noise_pred.device),
+            torch.tensor(
+                [span.row_count for span in input_batch.request_spans],
+                dtype=torch.long,
+                device=positive_noise_pred.device,
+            ),
+        )
+        scales = torch.tensor(
+            input_batch.true_cfg_scales,
+            dtype=positive_noise_pred.dtype,
+            device=positive_noise_pred.device,
+        ).index_select(0, row_to_req)
+        noise_pred = negative_noise_pred + scales.reshape(-1, *([1] * (positive_noise_pred.ndim - 1))) * (
+            positive_noise_pred - negative_noise_pred
+        )
+        if not any(input_batch.cfg_normalize_flags):
+            return noise_pred
+
+        flags = torch.tensor(input_batch.cfg_normalize_flags, dtype=torch.bool, device=positive_noise_pred.device)
+        normalize_rows = flags.index_select(0, row_to_req)
+        if bool(normalize_rows.all()):
+            return self.cfg_normalize_function(positive_noise_pred, noise_pred)
+
+        normalized = self.cfg_normalize_function(positive_noise_pred, noise_pred)
+        return torch.where(normalize_rows.reshape(-1, *([1] * (noise_pred.ndim - 1))), normalized, noise_pred)
+
+    def _uses_ring_sp(self) -> bool:
+        parallel_config = getattr(self, "parallel_config", None)
+        return (
+            parallel_config is not None
+            and int(getattr(parallel_config, "sequence_parallel_size", 1) or 1) > 1
+            and int(getattr(parallel_config, "ring_degree", 1) or 1) > 1
+        )
+
+    def forward_branch(self, input_batch: "InputBatch", *, branch: str) -> torch.Tensor:
+        """Run one packed transformer branch (positive/negative) for a step.
+
+        vLLM-style stage helper (≈ ``model.forward``): builds the single packed
+        denoise kwargs for ``branch`` and returns the packed ``[num_img_tokens, C]``
+        noise. Attention metadata is threaded through the active forward context
+        (keyed by ``attention_id`` = ``qwen_image.joint.{branch}``).
+        """
+        return self._expect_dynamic_noise(
+            self.predict_noise(**self._build_dynamic_denoise_kwargs(input_batch, branch=branch)),
+            branch=branch,
+            img_seq_lens=input_batch.img_seq_lens,
+        )
+
+    def _denoise_step_dynamic_batch(self, input_batch: "InputBatch") -> torch.Tensor:
+        positive_noise_pred = self.forward_branch(input_batch, branch="positive")
+        if input_batch.do_true_cfg:
+            negative_noise_pred = self.forward_branch(input_batch, branch="negative")
+            return self.combine_cfg(positive_noise_pred, negative_noise_pred, input_batch)
+        return positive_noise_pred
+
     def denoise_step(
         self,
         input_batch: "InputBatch",
@@ -910,6 +1085,9 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         self._current_timestep = t
         self.transformer.do_true_cfg = input_batch.do_true_cfg
 
+        if input_batch.is_dynamic:
+            return self._denoise_step_dynamic_batch(input_batch)
+
         positive_kwargs, negative_kwargs, output_slice = self._build_denoise_kwargs(
             latents=input_batch.latents,
             timestep=t,
@@ -928,6 +1106,19 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
                 "return_dict": False,
             },
         )
+
+        has_mixed_request_cfg = (
+            input_batch.do_true_cfg
+            and negative_kwargs is not None
+            and (len(set(input_batch.true_cfg_scales)) > 1 or len(set(input_batch.cfg_normalize_flags)) > 1)
+        )
+        if has_mixed_request_cfg:
+            positive_noise_pred = self.predict_noise(**positive_kwargs)
+            negative_noise_pred = self.predict_noise(**negative_kwargs)
+            if output_slice is not None:
+                positive_noise_pred = positive_noise_pred[:, :output_slice]
+                negative_noise_pred = negative_noise_pred[:, :output_slice]
+            return self._combine_dense_cfg(positive_noise_pred, negative_noise_pred, input_batch)
 
         return self.predict_noise_maybe_with_cfg(
             input_batch.do_true_cfg,
@@ -971,7 +1162,20 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         width = state.sampling.width or self.default_sample_size * self.vae_scale_factor
         output_type = kwargs.get("output_type", "pil")
 
-        return self._decode_latents(state.latents, height, width, output_type)
+        output = self._decode_latents(state.latents, height, width, output_type)
+        return output
+
+    def post_decode_batch(
+        self,
+        states: list["DiffusionRequestState"],
+        **kwargs: Any,
+    ) -> dict[str, DiffusionOutput]:
+        self._current_timestep = None
+
+        output_type = kwargs.get("output_type", "pil")
+        # Decode final VAE outputs one at a time so stepwise batching matches
+        # the serial decode kernel path exactly; denoising remains batched.
+        return {state.request_id: self.post_decode(state, output_type=output_type) for state in states}
 
     def forward(
         self,

@@ -122,7 +122,13 @@ def _make_request(tag: str):
     return SimpleNamespace(
         request_id=tag,
         prompts=[f"prompt_{tag}"],
-        sampling_params=SimpleNamespace(num_inference_steps=1, **_SAMPLING_KEY_DEFAULTS),
+        sampling_params=SimpleNamespace(
+            num_inference_steps=1,
+            timesteps=None,
+            sigmas=None,
+            step_index=None,
+            **_SAMPLING_KEY_DEFAULTS,
+        ),
     )
 
 
