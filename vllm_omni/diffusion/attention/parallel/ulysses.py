@@ -146,6 +146,185 @@ def _ulysses_all_to_all_any_o(
     return out
 
 
+def ulysses_flat_varlen_attention(
+    pg: dist.ProcessGroup,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+    *,
+    source_to_joint_idx: torch.Tensor,
+    joint_to_source_idx: torch.Tensor,
+    local_seq_len: int,
+    attention_fn,
+    use_sync: bool = False,
+) -> torch.Tensor:
+    """Run Ulysses all-to-all for flat packed varlen attention.
+
+    Input/output sequence order is caller-defined "source" order for this rank.
+    The helper reshards local source-order tokens to global source-order tokens
+    with local heads, reorders to varlen joint order for FlashAttention, then
+    restores local source order after the reverse all-to-all.
+    """
+    world_size = dist.get_world_size(pg)
+    if world_size == 1:
+        joint_query = query.index_select(0, source_to_joint_idx)
+        joint_key = key.index_select(0, source_to_joint_idx)
+        joint_value = value.index_select(0, source_to_joint_idx)
+        joint_out = attention_fn(joint_query, joint_key, joint_value, attn_metadata)
+        return joint_out.index_select(0, joint_to_source_idx)
+
+    if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
+        raise ValueError("Flat Ulysses varlen attention expects [local_tokens, heads, head_dim] Q/K/V.")
+    if attn_metadata.padded_tokens != 0:
+        raise ValueError("Flat Ulysses varlen attention expects padding-free metadata.")
+
+    seq_lens = _all_gather_int(pg, int(local_seq_len), device=query.device)
+    query_4d = query.unsqueeze(0)
+    key_4d = key.unsqueeze(0)
+    value_4d = value.unsqueeze(0)
+
+    query_4d, orig_head_cnt = _ulysses_all_to_all_any_qkv(
+        pg,
+        query_4d,
+        seq_lens=seq_lens,
+        use_sync=use_sync,
+    )
+    key_4d, _ = _ulysses_all_to_all_any_qkv(
+        pg,
+        key_4d,
+        seq_lens=seq_lens,
+        use_sync=use_sync,
+    )
+    value_4d, _ = _ulysses_all_to_all_any_qkv(
+        pg,
+        value_4d,
+        seq_lens=seq_lens,
+        use_sync=use_sync,
+    )
+
+    query = query_4d.squeeze(0).index_select(0, source_to_joint_idx)
+    key = key_4d.squeeze(0).index_select(0, source_to_joint_idx)
+    value = value_4d.squeeze(0).index_select(0, source_to_joint_idx)
+    joint_out = attention_fn(query, key, value, attn_metadata)
+
+    source_out = joint_out.index_select(0, joint_to_source_idx).unsqueeze(0)
+    local_out = _ulysses_all_to_all_any_o(
+        pg,
+        source_out,
+        seq_lens=seq_lens,
+        local_seq_len=int(local_seq_len),
+        orig_head_cnt=orig_head_cnt,
+        use_sync=use_sync,
+    )
+    return local_out.squeeze(0)
+
+
+def ulysses_flat_varlen_attention_with_replicated_prefix(
+    pg: dist.ProcessGroup,
+    prefix_query: torch.Tensor,
+    prefix_key: torch.Tensor,
+    prefix_value: torch.Tensor,
+    suffix_query: torch.Tensor,
+    suffix_key: torch.Tensor,
+    suffix_value: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+    *,
+    source_to_joint_idx: torch.Tensor,
+    joint_to_source_idx: torch.Tensor,
+    local_suffix_len: int,
+    attention_fn,
+    use_sync: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run flat varlen Ulysses with replicated prefix tokens.
+
+    The prefix stream is present on every rank and is sharded only by heads.
+    The suffix stream is sequence-sharded and uses Ulysses all-to-all. This
+    matches the dense dual-stream Qwen-Image SP path, where text is replicated
+    and image tokens are sequence-sharded.
+    """
+    world_size = dist.get_world_size(pg)
+    if world_size == 1:
+        query = torch.cat([prefix_query, suffix_query], dim=0)
+        key = torch.cat([prefix_key, suffix_key], dim=0)
+        value = torch.cat([prefix_value, suffix_value], dim=0)
+        joint_query = query.index_select(0, source_to_joint_idx)
+        joint_key = key.index_select(0, source_to_joint_idx)
+        joint_value = value.index_select(0, source_to_joint_idx)
+        source_out = attention_fn(joint_query, joint_key, joint_value, attn_metadata).index_select(
+            0, joint_to_source_idx
+        )
+        prefix_len = int(prefix_query.shape[0])
+        return source_out[:prefix_len], source_out[prefix_len:]
+
+    tensors = (prefix_query, prefix_key, prefix_value, suffix_query, suffix_key, suffix_value)
+    if any(tensor.ndim != 3 for tensor in tensors):
+        raise ValueError("Flat replicated-prefix Ulysses expects [tokens, heads, head_dim] Q/K/V.")
+    if attn_metadata.padded_tokens != 0:
+        raise ValueError("Flat replicated-prefix Ulysses expects padding-free metadata.")
+
+    seq_lens = _all_gather_int(pg, int(local_suffix_len), device=suffix_query.device)
+    suffix_query_4d, orig_head_cnt = _ulysses_all_to_all_any_qkv(
+        pg,
+        suffix_query.unsqueeze(0),
+        seq_lens=seq_lens,
+        use_sync=use_sync,
+    )
+    suffix_key_4d, _ = _ulysses_all_to_all_any_qkv(
+        pg,
+        suffix_key.unsqueeze(0),
+        seq_lens=seq_lens,
+        use_sync=use_sync,
+    )
+    suffix_value_4d, _ = _ulysses_all_to_all_any_qkv(
+        pg,
+        suffix_value.unsqueeze(0),
+        seq_lens=seq_lens,
+        use_sync=use_sync,
+    )
+
+    def _slice_prefix_heads(x: torch.Tensor) -> torch.Tensor:
+        head_cnt = int(x.shape[-2])
+        padded_head_cnt = _ceil_div(head_cnt, world_size) * world_size
+        if padded_head_cnt != head_cnt:
+            x = F.pad(x, (0, 0, 0, padded_head_cnt - head_cnt))
+        heads_per_rank = padded_head_cnt // world_size
+        rank = dist.get_rank(pg)
+        return x[:, heads_per_rank * rank : heads_per_rank * (rank + 1), :].contiguous()
+
+    prefix_query = _slice_prefix_heads(prefix_query)
+    prefix_key = _slice_prefix_heads(prefix_key)
+    prefix_value = _slice_prefix_heads(prefix_value)
+
+    query = torch.cat([prefix_query, suffix_query_4d.squeeze(0)], dim=0)
+    key = torch.cat([prefix_key, suffix_key_4d.squeeze(0)], dim=0)
+    value = torch.cat([prefix_value, suffix_value_4d.squeeze(0)], dim=0)
+    joint_query = query.index_select(0, source_to_joint_idx)
+    joint_key = key.index_select(0, source_to_joint_idx)
+    joint_value = value.index_select(0, source_to_joint_idx)
+    joint_out = attention_fn(joint_query, joint_key, joint_value, attn_metadata)
+
+    source_out = joint_out.index_select(0, joint_to_source_idx)
+    prefix_len = int(prefix_query.shape[0])
+    prefix_out = source_out[:prefix_len].contiguous()
+    suffix_out = source_out[prefix_len:].unsqueeze(0)
+    suffix_out = _ulysses_all_to_all_any_o(
+        pg,
+        suffix_out,
+        seq_lens=seq_lens,
+        local_seq_len=int(local_suffix_len),
+        orig_head_cnt=orig_head_cnt,
+        use_sync=use_sync,
+    ).squeeze(0)
+
+    gathered_prefix = [torch.zeros_like(prefix_out) for _ in range(world_size)]
+    dist.all_gather(gathered_prefix, prefix_out, group=pg)
+    prefix_out = torch.cat(gathered_prefix, dim=1)
+    if prefix_out.shape[1] != orig_head_cnt:
+        prefix_out = prefix_out[:, :orig_head_cnt, :].contiguous()
+    return prefix_out, suffix_out
+
+
 @dataclass(frozen=True, slots=True)
 class _UlyssesCtx(ParallelAttentionContext):
     """Per-forward context for Ulysses sequence-parallel attention."""
