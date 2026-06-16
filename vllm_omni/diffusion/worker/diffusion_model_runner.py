@@ -14,7 +14,6 @@ import copy
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
-from typing import Any
 
 import torch
 from torch.profiler import record_function
@@ -22,6 +21,7 @@ from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
     install_prompt_embed_cache,
@@ -37,7 +37,7 @@ from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
-from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
+from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents, split_packed_noise
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
@@ -352,6 +352,14 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
+    def _supports_qwen_image_dynamic_step_batching(self) -> bool:
+        if self.pipeline is None:
+            return False
+        if not getattr(self.od_config, "step_execution", False):
+            return False
+        cls = self.pipeline.__class__
+        return cls.__name__ == "QwenImagePipeline" and "qwen_image" in cls.__module__
+
     def _update_states(
         self, scheduler_output: DiffusionSchedulerOutput
     ) -> tuple[list[DiffusionRequestState], list[str]]:
@@ -416,6 +424,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         input_batch = InputBatch.make_batch(
             states,
             cached_batch=getattr(self, "input_batch", None),
+            allow_dynamic=self._supports_qwen_image_dynamic_step_batching(),
+            force_dynamic_request_view=self._supports_qwen_image_dynamic_step_batching(),
+            require_prompt_embeds=self._supports_qwen_image_dynamic_step_batching(),
         )
         self.input_batch = input_batch
         return input_batch
@@ -427,6 +438,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         interrupted: bool = False,
     ):
         """Step-after update: clear cached state for completed request."""
+        if input_batch.is_dynamic:
+            self.input_batch = input_batch
+            for state in states:
+                if interrupted or state.denoise_completed:
+                    self.state_cache.pop(state.request_id, None)
+            return
+
         gathered_latents = torch.cat([state.latents for state in states], dim=0)
         if (
             input_batch.latents.size() == gathered_latents.size()
@@ -444,14 +462,71 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if interrupted or state.denoise_completed:
                 self.state_cache.pop(state.request_id, None)
 
-    def _prepare_attn_metadata(self, input_batch: InputBatch) -> Any:
+    def _make_qwen_image_metadata(
+        self,
+        input_batch: InputBatch,
+        *,
+        branch: str,
+    ) -> AttentionMetadata:
+        from vllm_omni.diffusion.attention.builder import QwenImageJointMetadataBuilder
+
+        builder = QwenImageJointMetadataBuilder(
+            transformer=getattr(getattr(self, "pipeline", None), "transformer", None),
+            parallel_config=getattr(getattr(self, "od_config", None), "parallel_config", None),
+        )
+        metadata = builder.build(input_batch, branch=branch)
+        return metadata
+
+    def _prepare_attn_metadata(self, input_batch: InputBatch) -> dict[str, AttentionMetadata]:
+        if self._supports_qwen_image_dynamic_step_batching():
+            metadata = {
+                "qwen_image.joint.positive": self._make_qwen_image_metadata(
+                    input_batch,
+                    branch="positive",
+                )
+            }
+            if input_batch.do_true_cfg:
+                metadata["qwen_image.joint.negative"] = self._make_qwen_image_metadata(
+                    input_batch,
+                    branch="negative",
+                )
+            return metadata
+
         model_state = getattr(self, "model_state", None)
         if model_state is None:
             return {}
         prepare_attn = getattr(model_state, "prepare_attn", None)
         if not callable(prepare_attn):
             return {}
-        return prepare_attn(input_batch)
+        metadata = prepare_attn(input_batch)
+        return metadata if isinstance(metadata, dict) else {}
+
+    def _prepare_inputs(
+        self, scheduler_output: DiffusionSchedulerOutput
+    ) -> tuple[list[DiffusionRequestState], list[str], InputBatch, dict[str, AttentionMetadata]]:
+        """Host-side input preparation for one stepwise denoise step.
+
+        vLLM-style separation (≈ ``GPUModelRunner.prepare_inputs``): resolve
+        per-request states, build the step-local ``InputBatch``, and derive the
+        packed joint attention metadata (positive/negative branches) — all before
+        the forward pass runs in ``execute_stepwise``.
+        """
+        states, new_request_ids = self._update_states(scheduler_output)
+        input_batch = self._prepare_batch_inputs(states, new_request_ids)
+        attn_metadata = self._prepare_attn_metadata(input_batch)
+        return states, new_request_ids, input_batch, attn_metadata
+
+    def _post_decode_completed_states(
+        self,
+        states: list[DiffusionRequestState],
+    ) -> dict[str, DiffusionOutput]:
+        post_decode_batch = getattr(self.pipeline, "post_decode_batch", None)
+        if callable(post_decode_batch) and len(states) > 1:
+            results = post_decode_batch(states)
+            if set(results) == {state.request_id for state in states}:
+                return results
+
+        return {state.request_id: self.pipeline.post_decode(state) for state in states}
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
@@ -467,9 +542,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
-            states, new_request_ids = self._update_states(scheduler_output)
-            input_batch = self._prepare_batch_inputs(states, new_request_ids)
-            attn_metadata = self._prepare_attn_metadata(input_batch)
+            states, new_request_ids, input_batch, attn_metadata = self._prepare_inputs(scheduler_output)
 
             with set_forward_context(
                 vllm_config=self.vllm_config,
@@ -493,26 +566,50 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
                 else:
                     offset = 0
-                    for req in states:
-                        row_num = req.latents.shape[0]
-                        self.pipeline.step_scheduler(
-                            req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                        )
-                        offset = offset + row_num
-                        if req.denoise_completed:
-                            result = self.pipeline.post_decode(req)
+                    if input_batch.is_dynamic and noise_pred is not None:
+                        if not torch.is_tensor(noise_pred):
+                            raise ValueError("Dynamic stepwise denoise must return packed noise tensor.")
+                        if input_batch.img_query_start_loc_np is None:
+                            raise ValueError("Dynamic stepwise denoise requires img_query_start_loc.")
+                        # vLLM idiom: slice packed noise by image-token cu_seqlens.
+                        dynamic_noise_pred = split_packed_noise(noise_pred, input_batch.img_query_start_loc_np)
+                        if len(dynamic_noise_pred) != len(states):
+                            raise ValueError("Dynamic stepwise denoise split did not match request count.")
+                    else:
+                        dynamic_noise_pred = None
+
+                    completed_states: list[DiffusionRequestState] = []
+                    output_by_request_id: dict[str, RunnerOutput] = {}
+                    for req_idx, req in enumerate(states):
+                        if input_batch.is_dynamic:
+                            req_noise_pred = None if dynamic_noise_pred is None else dynamic_noise_pred[req_idx]
                         else:
-                            result = None
-                        runner_output_list.append(
-                            RunnerOutput(
+                            row_num = req.latents.shape[0]
+                            req_noise_pred = noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                            offset = offset + row_num
+                        self.pipeline.step_scheduler(req, req_noise_pred)
+                        if req.denoise_completed:
+                            completed_states.append(req)
+                        else:
+                            output_by_request_id[req.request_id] = RunnerOutput(
                                 request_id=req.request_id,
                                 step_index=req.step_index,
-                                finished=req.denoise_completed,
-                                result=result,
+                                finished=False,
+                                result=None,
                             )
+
+                    decoded_results = self._post_decode_completed_states(completed_states) if completed_states else {}
+                    for req in completed_states:
+                        output_by_request_id[req.request_id] = RunnerOutput(
+                            request_id=req.request_id,
+                            step_index=req.step_index,
+                            finished=True,
+                            result=decoded_results[req.request_id],
                         )
 
-                    if noise_pred is not None and offset != noise_pred.shape[0]:
+                    runner_output_list.extend(output_by_request_id[req.request_id] for req in states)
+
+                    if not input_batch.is_dynamic and noise_pred is not None and offset != noise_pred.shape[0]:
                         raise ValueError(
                             f"Stepwise noise_pred consumed {offset} rows, "
                             f"but batched noise_pred has {noise_pred.shape[0]} rows."

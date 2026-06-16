@@ -20,6 +20,7 @@ from typing import Any
 
 import torch
 import zmq
+from vllm import envs
 from vllm.config import CompilationConfig, DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
@@ -233,6 +234,17 @@ class DiffusionWorker:
         self.device = current_omni_platform.get_torch_device(rank)
         current_omni_platform.set_device(self.device)
 
+        parallel_config = self.od_config.parallel_config
+        qwen_image_dynamic_step = (
+            getattr(self.od_config, "step_execution", False)
+            and getattr(self.od_config, "model_class_name", None) == "QwenImagePipeline"
+        )
+        if qwen_image_dynamic_step or (
+            getattr(self.od_config, "step_execution", False) and int(parallel_config.tensor_parallel_size) > 1
+        ):
+            os.environ["VLLM_BATCH_INVARIANT"] = "1"
+            envs.disable_envs_cache()
+
         # Create vllm_config for parallel configuration. Pass explicit device_config
         # so DeviceConfig does not rely on current_platform in worker subprocesses.
         vllm_config = _create_diffusion_worker_vllm_config(self.device, self.od_config)
@@ -258,7 +270,6 @@ class DiffusionWorker:
             init_distributed_environment(world_size=world_size, rank=rank)
             logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
 
-            parallel_config = self.od_config.parallel_config
             initialize_model_parallel(
                 data_parallel_size=parallel_config.data_parallel_size,
                 cfg_parallel_size=parallel_config.cfg_parallel_size,
