@@ -1,9 +1,10 @@
-# MiniMax H3 disaggregated text encoder
+# MiniMax H3 disaggregated encoder stage
 
-This opt-in topology runs the Qwen3-VL text encoder as a vLLM stage and sends
-its hidden states and token-role metadata to an encoder-free diffusion stage.
-The standard MiniMax H3 recipes remain single-stage and continue to load the
-text encoder inside the diffusion pipeline.
+This opt-in topology runs the Qwen3-VL text encoder, video VAE encoder, and
+audio WVAE encoder together in a vLLM stage. It sends their conditioning
+payload to an encoder-free diffusion stage. The standard MiniMax H3 recipes
+remain single-stage and continue to run all components inside the diffusion
+pipeline.
 
 ## Start the server
 
@@ -22,6 +23,14 @@ size 1, Ulysses degree 4, and VAE patch parallel size 4. Adjust the
 deployment override for the available hardware. Diffusion quantization,
 layerwise offload, distributed layerwise offload, VAE parallelism, and USP
 settings use the same stage 1 options documented in [MiniMax-H3.md](MiniMax-H3.md).
+
+Stage 0's `tensor_parallel_size` defines one shared rank group for all three
+encoder roles; it does not choose each role's execution strategy. The required
+`hf_overrides.minimax_h3_encoder_components` mapping declares those strategies
+explicitly: `text_encoder` uses tensor parallelism, `video_vae` uses patch
+parallelism, and `audio_wvae` runs on the group leader. All three role entries
+are mandatory. They share the stage's `max_num_seqs` scheduler and batch limit;
+the configuration does not create independent role schedulers or world sizes.
 
 For example, this five-GPU topology assigns one GPU to the encoder and four
 to the diffusion stage. `--stage-overrides` keeps placement and parallelism
