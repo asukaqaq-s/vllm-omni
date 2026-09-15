@@ -2305,6 +2305,9 @@ class MiniMaxH3Pipeline(
                     "latent_h": context["latent_h"],
                     "latent_w": context["latent_w"],
                     "audio_t": context["audio_t"],
+                    "preencode_mp4": context.get("preencode_mp4", False),
+                    "preencode_batch_frames": context.get("preencode_batch_frames", 17),
+                    "video_codec_options": context.get("video_codec_options"),
                 },
             }
         )

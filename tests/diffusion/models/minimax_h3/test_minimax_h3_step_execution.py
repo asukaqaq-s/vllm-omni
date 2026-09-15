@@ -111,6 +111,7 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     pipeline.load_text_encoder = False
+    pipeline.load_vae_encoder = False
     pipeline.transformer = model
     pipeline.device = torch.device("cpu")
     pipeline._transformer_for_task = lambda task: model
