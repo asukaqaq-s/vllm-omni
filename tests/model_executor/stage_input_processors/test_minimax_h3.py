@@ -208,7 +208,7 @@ def test_prepare_ref2va_rejects_short_embedded_video_audio(monkeypatch):
         prepare_encoder_prompt(prompt, [sampling])
 
 
-def test_prepare_ref2va_rejects_combined_embedded_and_standalone_audio_duration(monkeypatch):
+def test_prepare_ref2va_keeps_embedded_and_standalone_audio_budgets_separate(monkeypatch):
     duration_seconds = 8.0
     sample_rate = 16_000
     _mock_ref2va_video_with_audio(monkeypatch, duration_seconds=duration_seconds)
@@ -226,8 +226,12 @@ def test_prepare_ref2va_rejects_combined_embedded_and_standalone_audio_duration(
         },
     }
 
-    with pytest.raises(OmniClientError, match="at most 15 seconds in total"):
-        prepare_encoder_prompt(prompt, [sampling])
+    transformed = prepare_encoder_prompt(prompt, [sampling])
+    assert transformed["mm_processor_kwargs"][MINIMAX_H3_CONDITION_LABELS_KEY] == [
+        ("audio", 1),
+        ("video", 1),
+        ("audio", 2),
+    ]
 
 
 def _encoder_output() -> dict:

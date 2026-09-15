@@ -8,7 +8,6 @@ import pytest
 import torch
 
 from vllm_omni.data_entry_keys import flatten_payload
-from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MiniMaxH3EncoderConditioning,
     MiniMaxH3EncoderMediaConditioning,
@@ -242,7 +241,7 @@ def test_encoder_runs_video_and_audio_components_on_ar_model() -> None:
     assert conditioning.ref_blocks[1]["kind"] == "video_audio"
 
 
-def test_prepare_encoder_inputs_applies_shared_reference_audio_budget(monkeypatch) -> None:
+def test_prepare_encoder_inputs_keeps_reference_audio_budgets_separate(monkeypatch) -> None:
     from vllm_omni.model_executor.models.minimax_h3 import encoder_processing as processing
 
     frames = torch.zeros(1, 32, 32, 3, dtype=torch.uint8).numpy()
@@ -263,14 +262,17 @@ def test_prepare_encoder_inputs_applies_shared_reference_audio_budget(monkeypatc
     )
     monkeypatch.setattr(processing, "load_video_audio", lambda *_args, **_kwargs: (waveform, 32_000))
 
-    with pytest.raises(OmniClientError, match="at most 15 seconds in total"):
-        processing.prepare_encoder_inputs(
-            {
-                "prompt": "reference",
-                "multi_modal_data": {"video": "reference.mp4", "audio": (waveform, 32_000)},
-            },
-            SimpleNamespace(extra_args={"task": "ref2va"}),
-        )
+    prepared = processing.prepare_encoder_inputs(
+        {
+            "prompt": "reference",
+            "multi_modal_data": {"video": "reference.mp4", "audio": (waveform, 32_000)},
+        },
+        SimpleNamespace(extra_args={"task": "ref2va"}),
+    )
+
+    assert prepared.media.video_audios[0][0].shape[-1] == 320_000
+    assert prepared.media.audios[0][0].shape[-1] == 320_000
+    assert prepared.condition_labels == [("audio", 1), ("video", 1), ("audio", 2)]
 
 
 @pytest.mark.parametrize(
