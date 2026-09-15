@@ -288,9 +288,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         if self.encode_only:
             self.remote = _load_video_vae_encoder(component_path, self.config_dict)
         else:
-            self.remote = _load_remote_component(
-                component_path, self.config_dict, trust_remote_code=trust_remote_code
-            )
+            self.remote = _load_remote_component(component_path, self.config_dict, trust_remote_code=trust_remote_code)
             if self.decode_only:
                 _remove_modules(self.remote.model, ("encoder", "quant_conv"))
         # Match the reference loader contract before installing inference-only
@@ -816,9 +814,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         if self.encode_only:
             self.remote = _load_audio_vae_encoder(component_path, self.config_dict)
         else:
-            self.remote = _load_remote_component(
-                component_path, self.config_dict, trust_remote_code=trust_remote_code
-            )
+            self.remote = _load_remote_component(component_path, self.config_dict, trust_remote_code=trust_remote_code)
             if self.decode_only:
                 _remove_modules(self.remote.model, ("encoder", "pre_block", "mean_proj"))
         # The checkpoint's audio VAE contract is FP32 for both reference
