@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -34,18 +35,20 @@ def _patch_encoder_constructors(monkeypatch, *, rank: int):
     group = SimpleNamespace(rank_in_group=rank, world_size=2, device_group=object())
 
     class FakeVideoVAE(torch.nn.Module):
-        def __init__(self, path, *, device, encode_only):
+        def __init__(self, path, *, device, encode_only, trust_remote_code):
             super().__init__()
             self.path = path
             self.parallel_args = None
+            self.trust_remote_code = trust_remote_code
 
         def set_parallel_size(self, size, *, process_group):
             self.parallel_args = (size, process_group)
 
     class FakeAudioVAE(torch.nn.Module):
-        def __init__(self, path, *, device, encode_only):
+        def __init__(self, path, *, device, encode_only, trust_remote_code):
             super().__init__()
             self.path = path
+            self.trust_remote_code = trust_remote_code
 
     def init_backbone(self, *, vllm_config, prefix):
         torch.nn.Module.__init__(self)
@@ -65,7 +68,7 @@ def _component_root(tmp_path):
     return root
 
 
-def _encoder_config(root, *, video_mode="patch", roles=None):
+def _encoder_config(root, *, video_mode="patch", roles=None, trust_remote_code=True):
     components = (
         {
             "text_encoder": {"parallel_mode": "tp"},
@@ -79,6 +82,7 @@ def _encoder_config(root, *, video_mode="patch", roles=None):
         model_config=SimpleNamespace(
             model=str(root / "text_encoder"),
             hf_config=SimpleNamespace(minimax_h3_encoder_components=components),
+            trust_remote_code=trust_remote_code,
         )
     )
 
@@ -95,15 +99,17 @@ def test_encoder_requires_exactly_three_components(monkeypatch, tmp_path) -> Non
 
 
 @pytest.mark.parametrize(("rank", "has_audio_vae"), [(0, True), (1, False)])
+@pytest.mark.parametrize("trust_remote_code", [False, True])
 def test_encoder_uses_tp_patch_and_leader_on_the_same_rank_set(
     monkeypatch,
     tmp_path,
     rank,
     has_audio_vae,
+    trust_remote_code,
 ) -> None:
     encoder_module, group = _patch_encoder_constructors(monkeypatch, rank=rank)
     root = _component_root(tmp_path)
-    config = _encoder_config(root)
+    config = _encoder_config(root, trust_remote_code=trust_remote_code)
 
     model = encoder_module.MiniMaxH3Encoder(vllm_config=config)
 
@@ -111,7 +117,37 @@ def test_encoder_uses_tp_patch_and_leader_on_the_same_rank_set(
     assert model.component_config.video_parallel_mode == "patch"
     assert model.component_config.audio_parallel_mode == "leader"
     assert model.video_vae.parallel_args == (2, group.device_group)
+    assert model.video_vae.trust_remote_code is trust_remote_code
     assert (model.audio_vae is not None) is has_audio_vae
+    if has_audio_vae:
+        assert model.audio_vae.trust_remote_code is trust_remote_code
+
+
+@pytest.mark.parametrize("component", ["video", "audio"])
+@pytest.mark.parametrize("trusted", [False, True])
+def test_encoder_only_vae_requires_remote_code_trust(monkeypatch, component, trusted) -> None:
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    config = {"auto_map": {"AutoModel": "modeling.RemoteVAE"}, "sample_rate": 32000}
+    monkeypatch.setattr(vae_module, "_load_component_config", lambda _path: config)
+    remote = torch.nn.Module()
+    remote.model = torch.nn.Module()
+    calls = []
+
+    def load_encoder(path, config_dict):
+        calls.append((path, config_dict))
+        return remote
+
+    monkeypatch.setattr(vae_module, f"_load_{component}_vae_encoder", load_encoder)
+    vae_cls = vae_module.MiniMaxH3VideoVAE if component == "video" else vae_module.MiniMaxH3AudioVAE
+    if trusted:
+        model = vae_cls("unused", device=torch.device("cpu"), encode_only=True, trust_remote_code=True)
+        assert model.remote is remote
+        assert calls == [("unused", config)]
+    else:
+        with pytest.raises(ValueError, match="trust-remote-code"):
+            vae_cls("unused", device=torch.device("cpu"), encode_only=True)
+        assert calls == []
 
 
 def test_encoder_requires_all_role_policies(monkeypatch, tmp_path) -> None:
@@ -203,6 +239,106 @@ def test_encoder_runs_video_and_audio_components_on_ar_model() -> None:
     assert conditioning.visual_condition_shapes == ((1, 2, 2), (1, 2, 2))
     assert conditioning.audio_condition_lengths == (80,)
     assert conditioning.ref_blocks[1]["kind"] == "video_audio"
+
+
+def test_prepare_encoder_inputs_keeps_reference_audio_budgets_separate(monkeypatch) -> None:
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing as processing
+
+    frames = torch.zeros(1, 32, 32, 3, dtype=torch.uint8).numpy()
+    waveform = torch.zeros(320_000)
+    monkeypatch.setattr(processing, "resolve_minimax_h3_shape", lambda *_args: (32, 32, 240, 60, 400))
+    monkeypatch.setattr(
+        processing,
+        "prepare_reference_videos",
+        lambda *_args, **_kwargs: [
+            {"prepared_path": "prepared.mp4", "original_path": "reference.mp4", "input_has_audio": True}
+        ],
+    )
+    monkeypatch.setattr(processing, "load_video_frames", lambda _path: frames)
+    monkeypatch.setattr(
+        processing,
+        "sample_reference_video_frames",
+        lambda *_args, **_kwargs: {"frames": [frames[0]], "block_timestamps": [[0.0]]},
+    )
+    monkeypatch.setattr(processing, "load_video_audio", lambda *_args, **_kwargs: (waveform, 32_000))
+
+    prepared = processing.prepare_encoder_inputs(
+        {
+            "prompt": "reference",
+            "multi_modal_data": {"video": "reference.mp4", "audio": (waveform, 32_000)},
+        },
+        SimpleNamespace(extra_args={"task": "ref2va"}),
+    )
+
+    assert prepared.media.video_audios[0][0].shape[-1] == 320_000
+    assert prepared.media.audios[0][0].shape[-1] == 320_000
+    assert prepared.condition_labels == [("audio", 1), ("video", 1), ("audio", 2)]
+
+
+@pytest.mark.parametrize(
+    ("embedded_lengths", "standalone_lengths", "valid"),
+    [((400,), (400,), True), ((320, 320), (400,), False), ((400,), (320, 320), False)],
+)
+def test_encode_media_keeps_audio_budgets_and_component_residency_separate(
+    embedded_lengths, standalone_lengths, valid
+) -> None:
+    from vllm_omni.model_executor.models.minimax_h3.encoder_processing import encode_media
+
+    active = None
+    scopes = []
+
+    class VideoVAE:
+        def encode_image(self, _image):
+            assert active is self
+            return torch.ones(1, 96)
+
+        def encode_video(self, _frames):
+            assert active is self
+            return torch.ones(1, 96), (1, 2, 2)
+
+    class AudioVAE:
+        def encode_waveform(self, waveform, _sample_rate):
+            assert active is self
+            length = waveform.shape[-1] // 800
+            return torch.ones(2 * length, 32), length
+
+    @contextmanager
+    def component_scope(component):
+        nonlocal active
+        assert active is None
+        active = component
+        scopes.append(component)
+        try:
+            yield
+        finally:
+            active = None
+
+    video_vae = VideoVAE()
+    audio_vae = AudioVAE()
+    media = MiniMaxH3EncoderMediaInput(
+        task="ref2va",
+        height=32,
+        width=32,
+        num_frames=360,
+        latent_t=90,
+        audio_t=600,
+        images=(torch.zeros(32, 32, 3, dtype=torch.uint8),),
+        videos=tuple(torch.zeros(1, 32, 32, 3, dtype=torch.uint8) for _ in embedded_lengths),
+        video_audios=tuple((torch.zeros(length * 800), 32_000) for length in embedded_lengths),
+        audios=tuple((torch.zeros(length * 800), 32_000) for length in standalone_lengths),
+    )
+    kwargs = dict(
+        video_vae=video_vae, audio_vae=audio_vae, emit_conditioning=True, component_scope=component_scope
+    )
+    if valid:
+        conditioning = encode_media(media, **kwargs)
+        assert conditioning.audio_condition_lengths == embedded_lengths + standalone_lengths
+        assert [block["kind"] for block in conditioning.ref_blocks] == ["image", "video_audio", "audio"]
+        conditioning.to_omni_components()
+    else:
+        with pytest.raises(ValueError, match="at most 15 seconds"):
+            encode_media(media, **kwargs)
+    assert scopes == [video_vae, audio_vae]
 
 
 def test_encoder_output_reuses_encoder_handoff_and_round_trips() -> None:

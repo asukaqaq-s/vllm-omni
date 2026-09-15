@@ -448,13 +448,15 @@ def prepare_encoder_inputs(
         audios=tuple((waveform.float().contiguous(), int(sample_rate)) for waveform, sample_rate in standalone_audios),
         keyframe_frame_indices=tuple(keyframe_indices),
     )
-    validate_reference_audio_waveforms(
-        _effective_audio_inputs(
-            media_input.video_audios,
-            media_input.audios,
-            max_standalone_seconds=float(media_input.num_frames) / MINIMAX_H3_FPS,
-        )
+    audio_inputs = _effective_audio_inputs(
+        media_input.video_audios,
+        media_input.audios,
+        max_standalone_seconds=float(media_input.num_frames) / MINIMAX_H3_FPS,
     )
+    embedded_audio_count = sum(item is not None for item in media_input.video_audios)
+    # Video soundtracks and standalone references have separate 15-second budgets.
+    validate_reference_audio_waveforms(audio_inputs[:embedded_audio_count])
+    validate_reference_audio_waveforms(audio_inputs[embedded_audio_count:])
 
     return PreparedEncoderInputs(
         prompt=text,
@@ -525,7 +527,7 @@ def encode_media(
     if audio_lengths:
         if any(length < 80 or length > 600 for length in audio_lengths):
             raise ValueError("MiniMax H3 audio references must each be between 2 and 15 seconds")
-        if sum(audio_lengths) > 600:
+        if sum(audio_lengths[:embedded_audio_count]) > 600 or sum(audio_lengths[embedded_audio_count:]) > 600:
             raise ValueError("MiniMax H3 audio references must be at most 15 seconds in total")
 
     ref_blocks: list[dict[str, Any]] = []

@@ -112,6 +112,7 @@ class MiniMaxH3Encoder(MiniMaxH3TextEncoderBackbone):
                 str(root / "video_vae"),
                 device=device,
                 encode_only=True,
+                trust_remote_code=vllm_config.model_config.trust_remote_code,
             )
             if self.component_config.video_parallel_mode == "patch":
                 if tp_group is None:
@@ -125,6 +126,7 @@ class MiniMaxH3Encoder(MiniMaxH3TextEncoderBackbone):
                 str(root / "audio_vae"),
                 device=device,
                 encode_only=True,
+                trust_remote_code=vllm_config.model_config.trust_remote_code,
             )
 
     @staticmethod
