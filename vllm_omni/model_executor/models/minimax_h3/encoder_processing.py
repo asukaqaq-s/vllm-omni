@@ -453,10 +453,10 @@ def prepare_encoder_inputs(
         media_input.audios,
         max_standalone_seconds=float(media_input.num_frames) / MINIMAX_H3_FPS,
     )
-    embedded_audio_count = sum(item is not None for item in media_input.video_audios)
-    # Video soundtracks and standalone references have separate 15-second budgets.
-    validate_reference_audio_waveforms(audio_inputs[:embedded_audio_count])
-    validate_reference_audio_waveforms(audio_inputs[embedded_audio_count:])
+    # Embedded soundtracks and standalone references share one request-level
+    # duration budget.  Validate the combined list so a mixed request cannot
+    # bypass the 15-second total limit by passing each category separately.
+    validate_reference_audio_waveforms(audio_inputs)
 
     return PreparedEncoderInputs(
         prompt=text,

@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm_omni.data_entry_keys import flatten_payload
+from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MiniMaxH3EncoderConditioning,
     MiniMaxH3EncoderMediaConditioning,
@@ -241,7 +242,7 @@ def test_encoder_runs_video_and_audio_components_on_ar_model() -> None:
     assert conditioning.ref_blocks[1]["kind"] == "video_audio"
 
 
-def test_prepare_encoder_inputs_keeps_reference_audio_budgets_separate(monkeypatch) -> None:
+def test_prepare_encoder_inputs_applies_shared_reference_audio_budget(monkeypatch) -> None:
     from vllm_omni.model_executor.models.minimax_h3 import encoder_processing as processing
 
     frames = torch.zeros(1, 32, 32, 3, dtype=torch.uint8).numpy()
@@ -262,17 +263,14 @@ def test_prepare_encoder_inputs_keeps_reference_audio_budgets_separate(monkeypat
     )
     monkeypatch.setattr(processing, "load_video_audio", lambda *_args, **_kwargs: (waveform, 32_000))
 
-    prepared = processing.prepare_encoder_inputs(
-        {
-            "prompt": "reference",
-            "multi_modal_data": {"video": "reference.mp4", "audio": (waveform, 32_000)},
-        },
-        SimpleNamespace(extra_args={"task": "ref2va"}),
-    )
-
-    assert prepared.media.video_audios[0][0].shape[-1] == 320_000
-    assert prepared.media.audios[0][0].shape[-1] == 320_000
-    assert prepared.condition_labels == [("audio", 1), ("video", 1), ("audio", 2)]
+    with pytest.raises(OmniClientError, match="at most 15 seconds in total"):
+        processing.prepare_encoder_inputs(
+            {
+                "prompt": "reference",
+                "multi_modal_data": {"video": "reference.mp4", "audio": (waveform, 32_000)},
+            },
+            SimpleNamespace(extra_args={"task": "ref2va"}),
+        )
 
 
 @pytest.mark.parametrize(
@@ -327,9 +325,7 @@ def test_encode_media_keeps_audio_budgets_and_component_residency_separate(
         video_audios=tuple((torch.zeros(length * 800), 32_000) for length in embedded_lengths),
         audios=tuple((torch.zeros(length * 800), 32_000) for length in standalone_lengths),
     )
-    kwargs = dict(
-        video_vae=video_vae, audio_vae=audio_vae, emit_conditioning=True, component_scope=component_scope
-    )
+    kwargs = dict(video_vae=video_vae, audio_vae=audio_vae, emit_conditioning=True, component_scope=component_scope)
     if valid:
         conditioning = encode_media(media, **kwargs)
         assert conditioning.audio_condition_lengths == embedded_lengths + standalone_lengths

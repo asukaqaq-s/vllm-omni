@@ -1020,6 +1020,8 @@ class MiniMaxH3Pipeline(
                 raise ValueError(f"MiniMax-H3 weight source {prefix!r} is not contiguous")
             loaded_prefixes.add(prefix)
             component = getattr(self, prefix.removesuffix("."))
+            if component is None:
+                raise ValueError(f"MiniMax-H3 component {prefix.removesuffix('.')!r} is disabled in this deployment")
             stream = ((name[len(prefix) :], tensor) for name, tensor in grouped_weights)
             if prefix == "transformer." and self._fasth3 is not None:
                 # Fuse before the model shards anything, which is also the only
@@ -1363,11 +1365,6 @@ class MiniMaxH3Pipeline(
         if self._is_output_owner_rank():
             return tensor.cpu()
         return torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
-
-
-
-
-
 
     def _initial_noise(
         self,
