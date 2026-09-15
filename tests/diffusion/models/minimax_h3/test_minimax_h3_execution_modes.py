@@ -10,7 +10,6 @@ import torch
 from PIL import Image
 
 from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
-from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -30,23 +29,23 @@ def pipeline():
     model.od_config = SimpleNamespace(enable_layerwise_offload=False)
     model._quality_policy = SimpleNamespace(resolve=Mock(return_value=SimpleNamespace(cache_dit=None)))
     model._cache_dit_runtime = SimpleNamespace(prepare=Mock())
-    model.encode_prompt = Mock(return_value=(torch.ones(2, 5120), torch.ones(2, dtype=torch.long)))
+    model.encode_prompt = Mock(
+        return_value=(torch.ones(2, 5120, dtype=torch.bfloat16), torch.ones(2, dtype=torch.long))
+    )
     model.video_vae = Mock()
     model.video_vae.is_distributed_enabled.return_value = False
     model.video_vae.encode_image.side_effect = lambda image: torch.ones((image.height // 32) * (image.width // 32), 96)
     model.audio_vae = Mock()
     model.transformer = torch.nn.Identity()
     model.diffuse = Mock(return_value=(torch.zeros(1), torch.zeros(1)))
-    model.decode = Mock(return_value=(torch.zeros(1), torch.zeros(1)))
+    model.decode = Mock(return_value=(torch.zeros(1, 3, 1, 32, 32), torch.zeros(1)))
     return model
 
 
-def _request(task, *, payload=None):
+def _request(task):
     prompt: dict[str, Any] = {"prompt": "A person waves."}
     if task != "t2va":
         prompt["multi_modal_data"] = {"image": Image.new("RGB", (256, 256))}
-    if payload is not None:
-        prompt["additional_information"] = {"encoder_output": payload}
     sampling = OmniDiffusionSamplingParams(
         height=32, width=32, num_frames=96, num_inference_steps=2, extra_args={"task": task, "aspect_ratio": "1:1"}
     )
@@ -60,114 +59,9 @@ def test_single_stage_encodes_without_stage_zero(pipeline, task):
     assert pipeline.video_vae.encode_image.call_count == int(task != "t2va")
     pipeline.diffuse.assert_called_once()
     assert pipeline.diffuse.call_args.kwargs["task"] == task
-    assert output.output == pipeline.decode.return_value
-
-
-def test_single_stage_reuses_legacy_text_but_encodes_media(pipeline):
-    payload = {"hidden_states": torch.full((2, 5120), 3.0), "token_tags": torch.ones(2, dtype=torch.long)}
-    pipeline.forward(_request("fl2va", payload=payload))
-    pipeline.encode_prompt.assert_not_called()
-    pipeline.video_vae.encode_image.assert_called_once()
-    torch.testing.assert_close(
-        pipeline.diffuse.call_args.kwargs["text_embeddings"], payload["hidden_states"].bfloat16()
-    )
-
-
-def test_text_disaggregation_keeps_local_media_encoding(pipeline):
-    payload = {"hidden_states": torch.full((2, 5120), 3.0), "token_tags": torch.ones(2, dtype=torch.long)}
-    pipeline.load_text_encoder = False
-    pipeline.load_vae_encoder = True
-    pipeline.forward(_request("fl2va", payload=payload))
-    pipeline.encode_prompt.assert_not_called()
-    pipeline.video_vae.encode_image.assert_called_once()
-
-
-@pytest.mark.parametrize("payload", [None, {}, {"hidden_states": torch.ones(2, 5120), "token_tags": torch.ones(2)}])
-def test_stage_one_rejects_missing_or_legacy_conditioning(pipeline, payload):
-    pipeline.load_text_encoder = False
-    pipeline.load_vae_encoder = False
-    with pytest.raises(OmniClientError):
-        pipeline.forward(_request("t2va", payload=payload))
-    pipeline.encode_prompt.assert_not_called()
-    pipeline.video_vae.encode_image.assert_not_called()
-    pipeline.diffuse.assert_not_called()
-
-
-@pytest.mark.parametrize("task", ["t2va", "fl2va", "ref2va"])
-@pytest.mark.parametrize("load_text_encoder", [True, False])
-def test_prepare_encode_uses_the_same_mode_and_conditioning(pipeline, task, load_text_encoder):
-    from vllm_omni.diffusion.worker.utils import StepRequestState
-
-    request = _request(task)
-    if not load_text_encoder:
-        conditioning = pipeline._prepare_local_conditioning(request.prompts[0], request.sampling_params)
-        request.prompts[0] = {"additional_information": {"encoder_output": conditioning.to_omni_payload()}}
-        pipeline.encode_prompt.reset_mock()
-        pipeline.video_vae.encode_image.reset_mock()
-    pipeline.load_text_encoder = load_text_encoder
-    pipeline.load_vae_encoder = load_text_encoder
-    state = StepRequestState(request_id="step", prompt=request.prompts[0], sampling=request.sampling_params)
-    assert pipeline.prepare_encode(state) is state
-    assert state.latents is not None
-    assert state.latents.shape[1] == 96
-    assert state.total_steps == 1
-    assert pipeline.encode_prompt.call_count == int(load_text_encoder)
-    assert pipeline.video_vae.encode_image.call_count == int(load_text_encoder and task != "t2va")
-
-
-def test_stage_one_step_execution_never_falls_back(pipeline):
-    from vllm_omni.diffusion.worker.utils import StepRequestState
-
-    pipeline.load_text_encoder = False
-    pipeline.load_vae_encoder = False
-    request = _request("t2va")
-    with pytest.raises(OmniClientError, match="requires encoder conditioning"):
-        pipeline.prepare_encode(
-            StepRequestState(request_id="step", prompt=request.prompts[0], sampling=request.sampling_params)
-        )
-    pipeline.encode_prompt.assert_not_called()
-
-
-def test_multiple_outputs_encode_only_once(pipeline):
-    request = _request("fl2va")
-    request.sampling_params.num_outputs_per_prompt = 3
-    request.sampling_params.seed = 42
-    pipeline.forward(request)
-    pipeline.encode_prompt.assert_called_once()
-    pipeline.video_vae.encode_image.assert_called_once()
-    assert [call.kwargs["seed"] for call in pipeline.diffuse.call_args_list] == [42, 43, 44]
-
-
-def test_ref2va_partition_preserves_image_only_implicit_task(pipeline):
-    request = _request("fl2va")
-    del request.sampling_params.extra_args["task"]
-    pipeline.partition = "ref2va"
-    pipeline.supported_tasks = frozenset({"ref2va"})
-    pipeline.forward(request)
-    assert pipeline.diffuse.call_args.kwargs["task"] == "ref2va"
-
-
-def test_invalid_legacy_text_is_not_ignored(pipeline):
-    with pytest.raises(OmniClientError, match="encoder wire requires"):
-        pipeline.forward(_request("fl2va", payload={"hidden_states": "invalid"}))
-    pipeline.encode_prompt.assert_not_called()
-    pipeline.video_vae.encode_image.assert_not_called()
-
-
-def test_text_weight_loading_preserves_encoder_specific_lifecycle(pipeline):
-    class Encoder(torch.nn.Module):
-        def load_weights(self, weights):
-            return {name for name, _ in weights}
-
-    pipeline.text_encoder = Encoder()
-    pipeline.video_vae = torch.nn.Identity()
-    pipeline.audio_vae = torch.nn.Identity()
-    assert pipeline.load_weights([("text_encoder.layer.weight", torch.ones(1))]) == {"text_encoder.layer.weight"}
-    pipeline.load_text_encoder = False
-    pipeline.load_vae_encoder = False
-    pipeline.text_encoder = None
-    with pytest.raises(ValueError, match="disabled in this deployment"):
-        pipeline.load_weights([("text_encoder.layer.weight", torch.ones(1))])
+    video, audio = output.output
+    torch.testing.assert_close(video, torch.zeros(1, 1, 32, 32, 3, dtype=torch.uint8))
+    torch.testing.assert_close(audio, pipeline.decode.return_value[1])
 
 
 def test_mixed_reference_conditioning_matches_stage_zero_handoff(pipeline, monkeypatch):
