@@ -1586,11 +1586,14 @@ stages:
         deploy = load_deploy_config(Path(get_deploy_config_path("minimax_h3_disaggregated.yaml")))
         stages = merge_pipeline_deploy(pipeline, deploy)
 
-        assert stages[0].yaml_engine_args["model_arch"] == "MiniMaxH3TextEncoder"
+        assert stages[0].yaml_engine_args["model_arch"] == "MiniMaxH3Encoder"
         assert stages[1].yaml_engine_args["model_arch"] == "MiniMaxH3Pipeline"
         assert stages[0].yaml_runtime["num_replicas"] == 1
         assert stages[1].yaml_runtime["num_replicas"] == 1
-        assert stages[1].yaml_engine_args["model_loaded"] == {"text_encoder": False}
+        assert stages[1].yaml_engine_args["model_loaded"] == {
+            "text_encoder": False,
+            "vae_encoder": False,
+        }
         assert stages[0].yaml_engine_args["max_num_seqs"] == 1
         assert stages[0].yaml_engine_args["hf_overrides"]["minimax_h3_encoder_components"] == {
             "text_encoder": {"parallel_mode": "tp"},
@@ -1608,6 +1611,8 @@ stages:
 
         turbo = load_deploy_config(Path(get_deploy_config_path("minimax_h3_disaggregated_turbo.yaml")))
         turbo_stages = merge_pipeline_deploy(pipeline, turbo)
+        assert turbo_stages[0].yaml_engine_args["model_arch"] == stages[0].yaml_engine_args["model_arch"]
+        assert turbo_stages[1].yaml_engine_args["model_loaded"] == stages[1].yaml_engine_args["model_loaded"]
         assert turbo_stages[0].yaml_engine_args["hf_overrides"] == stages[0].yaml_engine_args["hf_overrides"]
         turbo_sampling = turbo_stages[1].yaml_extras["default_sampling_params"]
         assert turbo_sampling["num_inference_steps"] == 5
