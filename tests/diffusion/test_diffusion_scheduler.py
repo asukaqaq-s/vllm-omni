@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import queue
@@ -11,6 +11,7 @@ import torch
 import vllm.v1.core.single_type_kv_cache_manager as native_kv_managers
 from pytest_mock import MockerFixture
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
@@ -612,6 +613,79 @@ class TestRequestScheduler:
         assert output.finished_req_ids == {"native-error"}
         assert _new_ids(output) == ["after-error"]
         assert not manager.has_request("native-error")
+
+    @pytest.mark.parametrize("action", ["abort", "preempt"])
+    def test_diffusion_kv_loading_blocks_abort_and_preempt(self, mocker: MockerFixture, action: str) -> None:
+        _initialize_paged_scheduler(self.scheduler, num_blocks=5)
+        connector = mocker.Mock()
+        connector.get_num_new_matched_tokens.return_value = (4, True)
+        connector.request_finished.return_value = (False, None)
+        self.scheduler._kv_connector = connector
+        request = _make_request("loading")
+        request.diffusion_kv_requests = tuple(
+            DiffusionKVRequest(
+                f"loading/diffusion-kv/{i}",
+                sequence_id=i,
+                prefix_len=4,
+                target_len=4,
+                seq_len=8,
+                prompt_token_ids=[1, 2, 3, 4],
+            )
+            for i in range(2)
+        )
+        request.kv_transfer_params = {"num_transfer_tokens": 4, "do_remote_prefill": True}
+        manager = self.scheduler._diffusion_kv_manager
+        assert manager is not None
+        pool = manager.native_manager.block_pool
+        initial_free_blocks = pool.get_num_free_blocks()
+        self.scheduler.add_request(request)
+        scheduled = self.scheduler.schedule()
+        internal_ids = {f"loading/diffusion-kv/{i}" for i in range(2)}
+        assert scheduled.kv_transfer_request_ids == internal_ids
+        assert pool.get_num_free_blocks() == initial_free_blocks - 4
+        metadata = manager.get_metadata("loading")
+        state = self.scheduler.get_request_state("loading")
+        free_request = mocker.spy(manager, "free_request")
+
+        # Empty, unrelated, and partial completion must all retain both CFG rows.
+        for finished in (set(), {"other/diffusion-kv/0"}, {"loading/diffusion-kv/0"}):
+            self.scheduler.update_kv_connector_output(KVConnectorOutput(finished_recving=finished))
+            assert "loading" in self.scheduler._kv_loading_request_ids
+            if action == "abort":
+                with pytest.raises(RuntimeError, match="Cannot release diffusion pages before KV receive completes"):
+                    self.scheduler.finish_requests("loading", DiffusionRequestStatus.FINISHED_ABORTED)
+            else:
+                assert self.scheduler.preempt_request("loading") is False
+            assert state.status == DiffusionRequestStatus.RUNNING
+            assert self.scheduler._running == ["loading"]
+            assert not self.scheduler._waiting
+            assert not self.scheduler._finished_req_ids
+            assert not self.scheduler._kv_finished_request_ids
+            assert manager.has_request("loading")
+            assert manager.get_metadata("loading") == metadata
+            assert pool.get_num_free_blocks() == initial_free_blocks - 4
+            free_request.assert_not_called()
+            connector.request_finished.assert_not_called()
+
+        # The executor reports all internal sequences together once every rank is ready.
+        self.scheduler.update_kv_connector_output(KVConnectorOutput(finished_recving=internal_ids))
+        assert "loading" not in self.scheduler._kv_loading_request_ids
+        if action == "preempt":
+            assert self.scheduler.preempt_request("loading") is True
+            assert state.status == DiffusionRequestStatus.PREEMPTED
+            assert not self.scheduler._running
+            assert list(self.scheduler._waiting) == ["loading"]
+            assert manager.get_metadata("loading") == metadata
+            assert pool.get_num_free_blocks() == initial_free_blocks - 4
+            free_request.assert_not_called()
+        self.scheduler.finish_requests("loading", DiffusionRequestStatus.FINISHED_ABORTED)
+        assert state.status == DiffusionRequestStatus.FINISHED_ABORTED
+        assert not self.scheduler._running and not self.scheduler._waiting
+        assert self.scheduler._kv_finished_request_ids == internal_ids
+        assert connector.request_finished.call_count == 2
+        free_request.assert_called_once_with("loading")
+        assert not manager.has_request("loading")
+        assert pool.get_num_free_blocks() == initial_free_blocks
 
     def test_diffusion_kv_preemption_retains_allocation(self) -> None:
         _initialize_paged_scheduler(self.scheduler, num_blocks=3)
