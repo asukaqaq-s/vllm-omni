@@ -790,6 +790,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         "Diffusion KV metadata count must match the request batch: "
                         f"metadata={len(diffusion_kv_metadata)}, requests={len(reqs)}"
                     )
+                for req, metadata in zip(reqs, diffusion_kv_metadata, strict=True):
+                    req.kv_computed_tokens = tuple(seq.num_computed_tokens for seq in metadata.sequences)
                 paged_metadata = self._build_paged_attention_metadata(diffusion_kv_metadata)
                 paged_kv_runtime, paged_kv_context = self.diffusion_kv_backend.activate_paged_attention_metadata(
                     paged_metadata
@@ -1038,6 +1040,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     kv_sender_info=sched_new_req.req.kv_sender_info,
                     prepared_layout=getattr(sched_new_req.req, "prepared_layout", None),
                 )
+                if sched_new_req.diffusion_kv_metadata is not None:
+                    new_state.extra["kv_computed_tokens"] = tuple(
+                        seq.num_computed_tokens for seq in sched_new_req.diffusion_kv_metadata.sequences
+                    )
                 state_req = copy.copy(sched_new_req.req)
                 state_req.sampling_params = new_state.sampling
                 if self.kv_transfer_manager is not None:

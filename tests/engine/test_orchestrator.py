@@ -34,6 +34,7 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import (
+    NativeKVHandoffError,
     Orchestrator,
     OrchestratorRequestState,
     StreamingSegmentState,
@@ -1464,6 +1465,53 @@ async def test_add_request_attaches_native_kv_ticket_before_dispatch(mocker, nat
         )
     )
     dispatch.assert_awaited_once()
+
+
+def test_native_handoff_uses_bound_replica_and_reports_missing_binding(mocker) -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [mocker.Mock()]
+    orchestrator.stage_pools[0].get_bound_client.return_value = None
+    req_state = SimpleNamespace(native_kv_transfer_id="xfer-req")
+    output = SimpleNamespace(kv_transfer_params={"num_transfer_tokens": 4})
+
+    with pytest.raises(NativeKVHandoffError, match="bound AR replica"):
+        orchestrator._diffusion_submit_kwargs("req", 0, SimpleNamespace(engine_input_source=[0]), req_state, output)
+    orchestrator.stage_pools[0].get_bound_client.assert_called_once_with("req")
+    # The pool default points at replica 0; this request actually used replica 1.
+    orchestrator.stage_pools[0].stage_vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(engine_id="ar-0")
+    )
+    config = SimpleNamespace(engine_id="ar-1", kv_connector_extra_config={"bootstrap_addr": "http://host:8999"})
+    orchestrator.stage_pools[0].get_bound_client.return_value = SimpleNamespace(
+        vllm_config=SimpleNamespace(kv_transfer_config=config)
+    )
+    params = orchestrator._diffusion_submit_kwargs(
+        "req", 0, SimpleNamespace(engine_input_source=[0]), req_state, output
+    )
+    assert params["kv_transfer_params"]["remote_engine_id"] == "ar-1"
+    assert params["kv_transfer_params"]["remote_bootstrap_addr"] == "http://host:8999"
+    assert "remote_engine_id" not in output.kv_transfer_params
+
+
+@pytest.mark.asyncio
+async def test_native_handoff_failure_is_request_scoped(mocker):
+    orchestrator = object.__new__(Orchestrator)
+    fail = mocker.patch.object(orchestrator, "_fail_request_client_error", new_callable=mocker.AsyncMock)
+
+    def lost_binding():
+        raise NativeKVHandoffError("bound AR replica is unavailable")
+
+    assert not await orchestrator._dispatch_or_fail_request(
+        lost_binding, req_id="req", stage_id=1, operation="inter-stage forward"
+    )
+    fail.assert_awaited_once_with(
+        "req",
+        1,
+        "bound AR replica is unavailable",
+        status_code=502,
+        error_type="NativeKVHandoffError",
+        release_owners=True,
+    )
 
 
 async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> None:

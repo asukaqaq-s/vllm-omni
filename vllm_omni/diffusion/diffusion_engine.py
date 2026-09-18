@@ -657,6 +657,12 @@ class DiffusionEngine:
                 self._fail_engine(exc)
                 return
 
+            if not sched_output.scheduled_request_ids and self.scheduler._kv_draining_requests:
+                # Only exceptional in-flight receives need idle polling. New
+                # requests / aborts wake this wait immediately.
+                with self._cv:
+                    self._cv.wait(timeout=0.01)
+
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
 
@@ -781,7 +787,8 @@ class DiffusionEngine:
             target_builder = getattr(scheduler, "get_diffusion_kv_cleanup_targets", None)
             cleanup_targets = target_builder(unique_request_ids) if target_builder is not None else unique_request_ids
             try:
-                self.executor.remove_diffusion_kv_requests(cleanup_targets)
+                if cleanup_targets:
+                    self.executor.remove_diffusion_kv_requests(cleanup_targets)
             except Exception as exc:
                 self._fail_engine(exc)
                 raise
@@ -791,7 +798,32 @@ class DiffusionEngine:
             return
         try:
             output = self.executor.prepare_kv_for_forward(sched_output)
+            assert output is not None
             self.scheduler.update_kv_connector_output(output)
+            if not self.abort_queue.empty():
+                self._process_aborts_queue()
+            incomplete = sched_output.kv_transfer_request_ids - (output.finished_recving or set())
+            sched_output.finished_req_ids.update(self.scheduler.fail_incomplete_kv_loads(incomplete))
+            # Timed-out/cancelled requests must never reach model execution.
+            terminal = {
+                rid
+                for rid in sched_output.scheduled_request_ids
+                if (state := self.scheduler.get_request_state(rid)) is not None and state.is_finished()
+            }
+            if terminal:
+                sched_output.finished_req_ids.update(terminal)
+                sched_output.scheduled_new_reqs = [
+                    req for req in sched_output.scheduled_new_reqs if req.request_id not in terminal
+                ]
+                sched_output.scheduled_cached_reqs.request_ids = [
+                    rid for rid in sched_output.scheduled_cached_reqs.request_ids if rid not in terminal
+                ]
+                # is_empty / started-output handling may have already cached it.
+                sched_output.__dict__.pop("scheduled_request_ids", None)
+            drained = self.scheduler.completed_kv_drains()
+            if drained:
+                self._remove_diffusion_kv_requests(drained)
+                self.scheduler.release_kv_drains(drained)
         except Exception as exc:
             self._fail_engine(exc)
             raise
@@ -1044,7 +1076,11 @@ class DiffusionEngine:
             # keep scheduling and executing until the target request is finished
             while True:
                 self._process_aborts_queue()
-                sched_output = self.scheduler.schedule()
+                try:
+                    sched_output = self.scheduler.schedule()
+                except Exception as exc:
+                    self._fail_engine(exc)
+                    raise
                 if sched_output.is_empty:
                     if target_request_id in sched_output.finished_req_ids:
                         self._remove_diffusion_kv_requests([target_request_id])
@@ -1440,11 +1476,10 @@ class DiffusionEngine:
         request_ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
         request_ids = list(dict.fromkeys(request_ids))
 
-        self._remove_diffusion_kv_requests(request_ids)
-
         for request_id in request_ids:
             if self.scheduler.get_request_state(request_id) is not None:
                 self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+        self._remove_diffusion_kv_requests(request_ids)
 
     def _finalize_finished_request(
         self,

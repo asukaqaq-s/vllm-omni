@@ -2518,3 +2518,35 @@ def test_native_kv_producer_replica_identity_and_bootstrap_are_isolated(mocker, 
         assert kv_config.engine_id == "ar"
         assert kv_config.kv_connector_extra_config == {"bootstrap_port": 9100}
         assert dict(runtime_cfg.env) == {"KEEP": "value"}
+
+
+@pytest.mark.parametrize(
+    "roles, sources, async_chunk, valid",
+    [
+        (["kv_producer", "kv_consumer"], [0], False, True),
+        (["kv_producer", "kv_consumer"], [0], True, False),
+        ([None, "kv_consumer"], [0], False, False),
+        (["kv_producer", None], [0], False, False),
+        ([None, "kv_producer", "kv_consumer"], [1], False, False),
+        (["kv_producer", "kv_consumer"], [1], False, False),
+        ([None, None], [0], False, True),
+    ],
+)
+def test_native_kv_topology_rejects_silent_legacy_fallback(roles, sources, async_chunk, valid):
+    plans = []
+    for stage_id, role in enumerate(roles):
+        diffusion = stage_id == len(roles) - 1
+        config = types.SimpleNamespace(kv_role=role) if role else None
+        replica = types.SimpleNamespace(
+            metadata=types.SimpleNamespace(stage_type="diffusion" if diffusion else "llm", engine_input_source=sources),
+            stage_vllm_config=None if diffusion else types.SimpleNamespace(kv_transfer_config=config),
+            stage_cfg=types.SimpleNamespace(engine_args={"kv_transfer_config": config}),
+        )
+        plans.append(types.SimpleNamespace(stage_id=stage_id, replicas=[replica]))
+    runtime = object.__new__(StageRuntime)
+    runtime._async_chunk = async_chunk
+    if valid:
+        runtime._validate_native_kv_topology(plans)
+    else:
+        with pytest.raises(ValueError, match="two-stage"):
+            runtime._validate_native_kv_topology(plans)

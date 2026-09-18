@@ -11,7 +11,16 @@ The orchestrator creates one transfer ticket per request and resolves the
 bound AR replica's Mooncake endpoint after generation. DiT allocates the
 destination pages, waits for every worker rank to finish loading, and releases
 the source and destination pages only after the connector lifecycle completes.
-Connector failures fail-close the diffusion engine before page teardown.
+Request registration failures are rolled back before Worker dispatch. Receive
+timeouts and cancellation terminate the request without recycling in-flight
+pages: the scheduler retains them until every CFG row has completed on every
+rank. Late completion is polled only while such requests remain. If a peer
+never completes, its pages remain reserved until shutdown; other requests can
+continue using the remaining capacity. Invalid pages, missing Worker ranks,
+and failures without a proven rollback still stop the replica before teardown.
+The example sets `transfer_timeout: 60.0` seconds explicitly. Cancellation
+queued during a synchronous receive is processed when that receive completes
+or times out; it does not interrupt the remote write.
 
 ## Reference configuration
 
@@ -63,4 +72,18 @@ target ranks.
   TP/CFG/SP end-to-end combinations have not been exhaustively validated.
 - CFG-parallel end-to-end deployment is not part of this acceptance run.
 - Native AR-to-DiT transfer currently requires `async_chunk: false`.
-- TCP is validated. RDMA and multi-node deployment are not covered here.
+- TCP is covered by the acceptance run. The supplementary single-node RDMA
+  measurements use a separate short workload; they do not establish RDMA
+  support for multi-node deployment, which remains out of scope.
+- The native path currently validates the two-stage `AR(0) -> DiT(1)` graph. Other stage graphs are rejected during startup until
+  their producer/consumer edge mapping is implemented.
+- Sleep mode is disabled for the native paged path because registered KV pages
+  must remain mapped for the connector lifetime.
+
+- Ascend NPU adaptation and its performance validation are maintained in a
+  separate follow-up PR; the GPU acceptance results above do not validate NPU.
+- The homogeneous piecewise CUDA batching optimization is retained. A native
+  paged-attention CUDA graph capture/replay regression covers two CFG rows,
+  strided QKV, mixed causal/image spans, changed inputs, and output stability.
+  It must be run on CUDA hardware; CPU unit tests do not establish graph or
+  end-to-end performance acceptance.

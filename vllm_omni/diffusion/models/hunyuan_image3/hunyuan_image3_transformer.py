@@ -1846,6 +1846,8 @@ class HunYuanAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             scaling=self.scaling,
             image_token_len=4097,
+            # Native Mooncake pairs this canonical KV layer name with the AR
+            # HunYuanAttention: model.layers.N.self_attn.attn. Keep both in sync.
             prefix=f"model.{prefix}",
         )
         self.image_rope2d_emb = HunYuanRotary2DEmbedder(

@@ -1284,9 +1284,9 @@ class HunyuanImage3Pipeline(
 
         # 4. Encode conditional images
         # Skip encoding if AR KV reuse is enabled
-        from vllm_omni.diffusion.forward_context import get_paged_kv_computed_tokens
-
-        has_ar_kv = kwargs.get("ar_kv_data") or any(get_paged_kv_computed_tokens())
+        has_ar_kv = kwargs.get("ar_kv_data") or request_layout_utils.native_kv_covers_cond_images(
+            output, kwargs.get("kv_computed_tokens", ())
+        )
         if batch_cond_image_info is not None and len(batch_cond_image_info[0]) > 0 and not has_ar_kv:
             cond_vae_images, cond_timestep, cond_vit_images = self._encode_cond_image(
                 batch_cond_image_info, cfg_factor[mode], generator=generator
@@ -1898,6 +1898,7 @@ class HunyuanImage3Pipeline(
         pipe._guidance_scale = guidance_scale
         pipe._guidance_rescale = getattr(sampling, "guidance_rescale", 0.0)
 
+        ar_kv_kwargs = self._extract_ar_kv_from_sampling(sampling)
         model_kwargs = self.prepare_model_inputs(
             prompt=prompt,
             cot_text=cot_text,
@@ -1910,8 +1911,10 @@ class HunyuanImage3Pipeline(
             batch_cond_image_info=batch_cond_image_info,
             bot_task=tokenizer_bot_task,
             prepared_layout=request_layout_utils.get_hunyuan_prepared_layout(state),
+            kv_computed_tokens=state.extra.get("kv_computed_tokens", ()),
+            **ar_kv_kwargs,
         )
-        model_kwargs.update(self._extract_ar_kv_from_sampling(sampling))
+        model_kwargs.update(ar_kv_kwargs)
         model_kwargs["use_cache"] = False
 
         input_ids = model_kwargs.pop("input_ids")
@@ -2341,6 +2344,7 @@ class HunyuanImage3Pipeline(
             batch_cond_image_info=batch_cond_image_info,
             bot_task=tokenizer_bot_task,
             prepared_layout=request_layout_utils.get_hunyuan_prepared_layout(req.requests[0]),
+            kv_computed_tokens=getattr(req.requests[0], "kv_computed_tokens", ()),
             **ar_kv_kwargs,
         )
 

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
@@ -27,6 +28,10 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 
 logger = init_logger(__name__)
+
+
+class KVTransferRegistrationError(ValueError):
+    """A failed handoff whose destination pages have not been dispatched."""
 
 
 def mint_transfer_id(request_id: str) -> str:
@@ -146,9 +151,16 @@ def init_worker_kv_connector(vllm_config: VllmConfig, kv_cache_config: KVCacheCo
 
     from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 
+    # vLLM 0.29 Mooncake snapshots tp_rank/tp_size in its Worker constructor;
+    # consumer receive/region mapping use those saved values, not get_tp_group.
+    # Restrict this compatibility bridge to that connector and restore the
+    # model's TP group even when construction fails. Never remap model TP for
+    # the connector's entire lifetime (it would change model collectives).
     tp_group = parallel_state._TP
     parallel_config = getattr(vllm_config, "parallel_config", None)
     if getattr(parallel_config, "prefill_context_parallel_size", 1) > 1 and tp_group.world_size == 1:
+        if vllm_config.kv_transfer_config.kv_connector != "MooncakeConnector":
+            raise ValueError("Native SP KV transfer currently requires MooncakeConnector")
         parallel_state._TP = get_sp_group()
     try:
         ensure_kv_transfer_initialized(vllm_config, kv_cache_config)
@@ -184,6 +196,8 @@ def commit_kv_load(
     matched_tokens: list[int],
 ) -> set[str]:
     expected = set()
+    allocations = []
+    # Validate every CFG row before mutating any connector state.
     for request, num_tokens in zip(requests, matched_tokens, strict=True):
         blocks = manager.get_blocks(request.request_id)
         # Mooncake's producer advertises complete physical blocks. Keep every
@@ -195,7 +209,7 @@ def commit_kv_load(
         if num_tokens > 0 and request.kv_transfer_params is not None:
             transfer_tokens = request.kv_transfer_params["num_transfer_tokens"]
             if type(transfer_tokens) is not int or not num_tokens <= transfer_tokens <= request.num_tokens:
-                raise ValueError(
+                raise KVTransferRegistrationError(
                     "Diffusion KV transfer boundary must cover the reusable prefix "
                     f"without exceeding the allocated sequence: reusable={num_tokens}, "
                     f"transfer={transfer_tokens!r}, allocated={request.num_tokens}"
@@ -206,10 +220,31 @@ def commit_kv_load(
                 for group, spec in zip(blocks.blocks, manager.kv_cache_config.kv_cache_groups, strict=True)
             )
         )
-        connector.update_state_after_alloc(request, prefix_blocks, num_tokens)
-        request.num_computed_tokens = num_tokens
-        if request.kv_transfer_params is not None:
-            expected.add(request.request_id)
+        allocations.append((request, prefix_blocks, num_tokens))
+    try:
+        for request, prefix_blocks, num_tokens in allocations:
+            connector.update_state_after_alloc(request, prefix_blocks, num_tokens)
+            request.num_computed_tokens = num_tokens
+            if request.kv_transfer_params is not None:
+                expected.add(request.request_id)
+    except Exception as exc:
+        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import MooncakeConnector
+        from vllm.v1.request import RequestStatus
+
+        if not isinstance(connector, MooncakeConnector):
+            # Unknown connectors may have started I/O during registration.
+            raise
+        # Mooncake only queues metadata here; no Worker has seen addresses yet.
+        # Re-arm its pre-scheduling abort hook to replace even partially
+        # registered CFG receives with empty-block notifications to the producer.
+        for request in requests:
+            if request.kv_transfer_params is not None:
+                request.kv_transfer_params["do_remote_prefill"] = True
+                request.status = RequestStatus.FINISHED_ABORTED
+                delay_free, _ = connector.request_finished(request, [])
+                if delay_free:
+                    raise RuntimeError("Connector could not cancel an undispatched KV load") from exc
+        raise KVTransferRegistrationError(f"Could not register diffusion KV receive: {exc}") from exc
     return expected
 
 
@@ -238,7 +273,9 @@ def wait_for_kv_load(
         if not pending:
             break
         if time.monotonic() >= deadline:
-            raise TimeoutError(f"Timed out receiving diffusion KV for {sorted(pending)}")
+            # A timeout is not a cancellation acknowledgement. Return partial
+            # completion; Scheduler quarantines the remaining destination pages.
+            break
         time.sleep(0.001)
     output = active_connector.post_forward(finished_ids)
     output.finished_sending = sent | (output.finished_sending or set())
@@ -252,6 +289,10 @@ def _validate_kv_transfer_config(config: KVTransferConfig) -> None:
     engine_id = config.engine_id
     if not isinstance(engine_id, str) or not engine_id.strip():
         raise ValueError("Diffusion native kv_transfer_config requires a non-empty engine_id")
+    extra_config = config.kv_connector_extra_config or {}
+    timeout = extra_config.get("transfer_timeout", 60.0)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("Diffusion transfer_timeout must be a positive finite number of seconds")
     if config.kv_connector is not None and config.kv_role is None:
         raise ValueError("Diffusion native kv_transfer_config requires kv_role when kv_connector is set")
     if config.kv_role not in (None, "kv_consumer", "kv_producer", "kv_both"):

@@ -262,6 +262,10 @@ class StreamingInputState:
         return segment if segment is not None else StreamingSegmentState()
 
 
+class NativeKVHandoffError(RuntimeError):
+    """One request lost its producer binding or transfer metadata."""
+
+
 class OrchestratorBase:
     """Stage-management loop shared by the turn-based and duplex orchestrators.
 
@@ -1359,6 +1363,16 @@ class OrchestratorBase:
         try:
             await dispatch()
             return True
+        except NativeKVHandoffError as e:
+            await self._fail_request_client_error(
+                req_id,
+                stage_id,
+                str(e),
+                status_code=HTTPStatus.BAD_GATEWAY.value,
+                error_type="NativeKVHandoffError",
+                release_owners=True,
+            )
+            return False
         except StageUnavailableError as e:
             # No specific replica to evict: the stage already has no live
             # replica or the chosen slot was evicted. Fail just this request.
@@ -2589,17 +2603,21 @@ class OrchestratorBase:
         if req_state.native_kv_transfer_id is None:
             return {"kv_sender_info": self._build_kv_sender_info(source_stage_ids, request_id=request_id)}
         if output is None:
-            raise ValueError("Native KV handoff requires one completed AR source")
+            raise NativeKVHandoffError("Native KV handoff requires one completed AR source")
         from vllm_omni.diffusion.diffusion_kv.kv_connector import (
             bootstrap_addr_from_kv_transfer_config,
             build_target_kv_transfer_params,
         )
 
         source = self.stage_pools[source_stage_id].get_bound_client(request_id)
-        config = source.vllm_config.kv_transfer_config
-        params = output.kv_transfer_params
+        config = getattr(getattr(source, "vllm_config", None), "kv_transfer_config", None)
+        if source is None or config is None:
+            raise NativeKVHandoffError(
+                f"Native KV handoff for {request_id}: bound AR replica or its KV configuration is unavailable"
+            )
+        params = getattr(output, "kv_transfer_params", None)
         if not params or "num_transfer_tokens" not in params:
-            raise RuntimeError("AR source completed without native KV transfer metadata")
+            raise NativeKVHandoffError("AR source completed without native KV transfer metadata")
         return {
             "kv_transfer_params": build_target_kv_transfer_params(
                 source_params=params,

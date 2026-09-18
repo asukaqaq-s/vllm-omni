@@ -313,3 +313,31 @@ def test_rank_probe_gathers_local_failure_before_raising(monkeypatch) -> None:
         )
 
     assert gathered == [(False, "ValueError: local failure")]
+
+
+def test_hunyuan_native_layer_identity_matches_ar_spec(monkeypatch):
+    import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer as hy3
+
+    monkeypatch.setattr(hy3, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(hy3, "get_sequence_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(hy3, "get_allgather_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(hy3, "get_sequence_parallel_rank", lambda: 0)
+    monkeypatch.setattr(hy3, "QKVParallelLinear", lambda **_: nn.Identity())
+    monkeypatch.setattr(hy3, "RowParallelLinear", lambda **_: nn.Identity())
+    monkeypatch.setattr(hy3, "get_rope", lambda **_: nn.Identity())
+
+    # Only backend construction is fake; execute both HY3 constructors and the
+    # real runner spec-discovery path, including the actual Attention prefix.
+    def attention(**kwargs):
+        return _attention(enabled=kwargs.get("paged_kv_cache_role") is not None, prefix=kwargs["prefix"])
+
+    monkeypatch.setattr(hy3, "Attention", attention)
+    model = hy3.HunYuanAttention(
+        config=SimpleNamespace(num_key_value_heads=2, attention_head_dim=8),
+        hidden_size=16,
+        num_heads=2,
+        num_kv_heads=2,
+        prefix="layers.3.self_attn",
+    )
+    runner = _runner(model.image_attn.attn)
+    assert set(runner.get_kv_cache_spec()) == {"model.layers.3.self_attn.attn"}

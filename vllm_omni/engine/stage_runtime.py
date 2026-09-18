@@ -537,6 +537,7 @@ class StageRuntime:
             replicas_per_stage,
             replica_devices_map,
         )
+        self._validate_native_kv_topology(stage_plans)
         return stage_plans
 
     def _finalize_initialized_stages(
@@ -584,6 +585,45 @@ class StageRuntime:
             yield
 
     # ---- Internal methods ----
+
+    def _validate_native_kv_topology(self, plans: list[LogicalStageInitPlan]) -> None:
+        """Reject unsupported native AR->DiT graphs before launching any Worker."""
+        if not any(plan.replicas[0].metadata.stage_type == "diffusion" for plan in plans):
+            return  # Native LLM prefill/decode is outside this path.
+        roles = {}
+        for plan in plans:
+            replica = plan.replicas[0]
+            if replica.stage_vllm_config is not None:
+                config = getattr(replica.stage_vllm_config, "kv_transfer_config", None)
+            elif isinstance(replica.stage_cfg, VllmOmniDiffusionStageConfig):
+                config = (
+                    replica.stage_cfg.connector_config.kv_transfer_config
+                    or replica.stage_cfg.diffusion_config.kv_transfer_config
+                )
+            else:
+                args = getattr(replica.stage_cfg, "engine_args", {})
+                config = (
+                    args.get("kv_transfer_config")
+                    if isinstance(args, Mapping)
+                    else getattr(args, "kv_transfer_config", None)
+                )
+            if config is not None:
+                roles[plan.stage_id] = config.get("kv_role") if isinstance(config, Mapping) else config.kv_role
+        if not roles:
+            return
+        if (
+            self._async_chunk
+            or len(plans) != 2
+            or roles != {0: "kv_producer", 1: "kv_consumer"}
+            or plans[0].replicas[0].metadata.stage_type != "llm"
+            or plans[1].replicas[0].metadata.stage_type != "diffusion"
+            or list(plans[1].replicas[0].metadata.engine_input_source or []) != [0]
+        ):
+            raise ValueError(
+                "Native AR-to-DiT KV transfer currently supports only a two-stage "
+                "0 (kv_producer) -> 1 (diffusion kv_consumer, engine_input_source=[0]) "
+                "pipeline with async_chunk=False"
+            )
 
     def _build_logical_stage_init_plans(
         self,

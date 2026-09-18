@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -188,12 +191,18 @@ class DiffusionExecutor(ABC):
             unique_reply_rank=0,
             exec_all_ranks=True,
         )
-        if len(outputs) != self.od_config.num_gpus or any(
-            output.invalid_block_ids
-            or not scheduler_output.kv_transfer_request_ids.issubset(output.finished_recving or ())
-            for output in outputs
-        ):
-            raise RuntimeError("Diffusion KV receive did not complete on every rank")
+        if len(outputs) != self.od_config.num_gpus or any(output.invalid_block_ids for output in outputs):
+            # Missing ranks / invalid pages cannot establish safe ownership.
+            raise RuntimeError("Diffusion KV receive failed on one or more ranks")
+        completed = getattr(self, "_kv_receive_completed_ranks", {})
+        for rank, output in enumerate(outputs):
+            for request_id in output.finished_recving or ():
+                completed.setdefault(request_id, set()).add(rank)
+        finished = {request_id for request_id, ranks in completed.items() if len(ranks) == len(outputs)}
+        for request_id in finished:
+            del completed[request_id]
+        self._kv_receive_completed_ranks = completed
+        outputs[0].finished_recving = finished
         return outputs[0]
 
     @abstractmethod
