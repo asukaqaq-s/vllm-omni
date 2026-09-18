@@ -67,7 +67,9 @@ def test_native_kv_transfer_requires_completed_ar_stage(async_chunk):
     pipeline = SimpleNamespace(stages=(), model_type="test")
     deploy = DeployConfig(
         async_chunk=async_chunk,
-        stages=[StageDeployConfig(stage_id=0, engine_extras={"kv_transfer_config": {"kv_connector": "MooncakeConnector"}})],
+        stages=[
+            StageDeployConfig(stage_id=0, engine_extras={"kv_transfer_config": {"kv_connector": "MooncakeConnector"}})
+        ],
     )
     if async_chunk:
         with pytest.raises(ValueError, match="requires async_chunk=False"):
