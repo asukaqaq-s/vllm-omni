@@ -801,7 +801,14 @@ class DiffusionWorker:
         Args:
             level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
         """
-        if getattr(self.od_config, "kv_transfer_config", None) is not None:
+        # The config validator rejects sleep for the native paged path. Keep
+        # this worker-side guard precise as well: test doubles and legacy
+        # configs may expose arbitrary attributes through Mock/getattr.
+        if (
+            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+            and getattr(self.od_config, "kv_transfer_config", None) is not None
+        ):
             raise ValueError("Cannot sleep while native KV connector memory is registered")
         CuMemAllocator = _get_cumem_allocator_class()
         allocator = CuMemAllocator.get_instance()
