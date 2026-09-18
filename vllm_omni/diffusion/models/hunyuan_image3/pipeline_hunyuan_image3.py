@@ -338,6 +338,9 @@ class HunyuanImage3Pipeline(
     supports_step_execution: ClassVar[bool] = True
     supports_request_batch = False
     support_image_input = True
+    # The warmup request's blank image routes this AR+diffusion model down its
+    # image-edit path, where the token block cannot match the latent patch grid.
+    dummy_run_num_frames: ClassVar[int] = 0
     _dit_modules: ClassVar[list[str]] = ["model"]
     _encoder_modules: ClassVar[list[str]] = ["vision_model"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -456,11 +459,10 @@ class HunyuanImage3Pipeline(
 
         # Note: guidance_emb and timestep_r_emb are no longer skipped
         # to support HunyuanImage-3.0-Distil and MeanFlow distilled models
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=skip_prefixes,
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(
+            weights, mapper=WeightsMapper(orig_to_new_prefix={name: None for name in (skip_prefixes or ())})
         )
-        return loader.load_weights(weights)
 
     def prepare_seed(self, seed=None, batch_size=1):
         # random seed

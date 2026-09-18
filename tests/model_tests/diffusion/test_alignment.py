@@ -47,6 +47,7 @@ EXCLUDED_MODELS = [
     "LongCatVideoAvatarPipeline",
     "BagelPipeline",
     "BooguImagePipeline",
+    "BooguImageTurboPipeline",
     "LancePipeline",
     "MingImagePipeline",
     "InternVLAA1Pipeline",
@@ -81,7 +82,12 @@ EXCLUDED_MODELS = [
     "StableDiffusionXLPipeline",
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",
+    "Pi05Pipeline",
     "SanaWmPipeline",
+    # Audio pipeline conditioned by a separate Qwen2.5-Omni encoder stage;
+    # covered by tests/diffusion/models/auk (CPU pipeline tests, parity) and
+    # the real-checkpoint E2E test instead of a tiny model.
+    "AuKPipeline",
 ]
 
 

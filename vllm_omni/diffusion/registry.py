@@ -116,6 +116,11 @@ _DIFFUSION_MODELS = {
         "pipeline_minimax_h3",
         "MiniMaxH3Pipeline",
     ),
+    "AuKPipeline": (
+        "auk",
+        "pipeline_auk",
+        "AuKPipeline",
+    ),
     "StableAudioPipeline": (
         "stable_audio",
         "pipeline_stable_audio",
@@ -166,6 +171,11 @@ _DIFFUSION_MODELS = {
         "pipeline_boogu_image",
         "BooguImagePipeline",
     ),
+    "BooguImageTurboPipeline": (
+        "boogu_image",
+        "pipeline_boogu_image",
+        "BooguImageTurboPipeline",
+    ),
     "LancePipeline": (
         "lance",
         "pipeline_lance",
@@ -195,6 +205,11 @@ _DIFFUSION_MODELS = {
         "pi0",
         "pipeline_pi0",
         "Pi0Pipeline",
+    ),
+    "Pi05Pipeline": (
+        "pi05",
+        "pipeline_pi05",
+        "Pi05Pipeline",
     ),
     "LongCatImageEditPipeline": (
         "longcat_image",
@@ -372,6 +387,7 @@ _NO_CACHE_ACCELERATION = {
     # to it; list it here so a stray cache_backend override disables gracefully
     # instead of erroring.
     "Pi0Pipeline",
+    "Pi05Pipeline",
     "LingBotWorldCausalDMDPipeline",
 }
 
@@ -549,6 +565,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
     "BooguImagePipeline": "get_boogu_image_post_process_func",
+    "BooguImageTurboPipeline": "get_boogu_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
     "WanDMDPipeline": "get_wan22_post_process_func",
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
@@ -561,6 +578,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
+    "AuKPipeline": "get_auk_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
@@ -574,6 +592,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MingImagePipeline": "get_ming_image_post_process_func",
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
     "Pi0Pipeline": "get_pi0_post_process_func",
+    "Pi05Pipeline": "get_pi05_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "FluxKontextPipeline": "get_flux_kontext_post_process_func",
@@ -620,6 +639,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "BagelPipeline": "get_bagel_pre_process_func",
     "GlmImagePipeline": "get_glm_image_pre_process_func",
     "BooguImagePipeline": "get_boogu_image_pre_process_func",
+    "BooguImageTurboPipeline": "get_boogu_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",

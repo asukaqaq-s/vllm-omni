@@ -8,9 +8,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 from torch import nn
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 
 import vllm_omni.diffusion.worker.diffusion_worker as diffusion_worker_module
+from tests.helpers.kv_layout import build_kv_cache_tensor, layout_for_backend
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -79,7 +80,9 @@ def test_runner_discovers_native_spec_from_loaded_attention() -> None:
     assert spec.num_kv_heads == 2
     assert spec.head_size == 8
     assert spec.dtype is torch.bfloat16
-    assert spec.indexes_kv_by_block_stride is True
+    # vLLM 0.29 moved the block-stride decision off the spec onto the resolved
+    # physical layout; the backend's declaration must still select one.
+    assert layout_for_backend(_Backend).is_block_outermost is True
     assert spec.non_causal is True
 
 
@@ -112,7 +115,7 @@ def test_runner_retains_matching_rank_local_config() -> None:
     spec = runner.get_kv_cache_spec()["image_attention"]
     config = KVCacheConfig(
         num_blocks=8,
-        kv_cache_tensors=[KVCacheTensor(size=spec.page_size_bytes * 8, shared_by=["image_attention"])],
+        kv_cache_tensors=[build_kv_cache_tensor(spec, 8, ["image_attention"])],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["image_attention"], kv_cache_spec=spec)],
     )
 
@@ -126,7 +129,7 @@ def test_runner_rejects_rank_local_config_for_different_layers() -> None:
     spec = runner.get_kv_cache_spec()["image_attention"]
     config = KVCacheConfig(
         num_blocks=8,
-        kv_cache_tensors=[KVCacheTensor(size=spec.page_size_bytes * 8, shared_by=["other_attention"])],
+        kv_cache_tensors=[build_kv_cache_tensor(spec, 8, ["other_attention"])],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["other_attention"], kv_cache_spec=spec)],
     )
 
@@ -177,6 +180,7 @@ def test_worker_honors_explicit_kv_memory_budget(monkeypatch) -> None:
 
 
 def test_worker_treats_zero_kv_memory_budget_as_profiled_auto_sizing(monkeypatch) -> None:
+    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", SimpleNamespace(empty_cache=Mock()))
     worker = object.__new__(DiffusionWorker)
     worker.rank = 0
     worker.init_snapshot = SimpleNamespace(free_memory=900)
@@ -206,6 +210,7 @@ def test_worker_treats_zero_kv_memory_budget_as_profiled_auto_sizing(monkeypatch
 
 @pytest.mark.parametrize("non_kv_cache_memory", [750, 800])
 def test_worker_rejects_non_positive_profiled_kv_memory(monkeypatch, non_kv_cache_memory: int) -> None:
+    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", SimpleNamespace(empty_cache=Mock()))
     worker = object.__new__(DiffusionWorker)
     worker.rank = 0
     worker.init_snapshot = SimpleNamespace(free_memory=900)
@@ -242,6 +247,7 @@ def test_worker_rejects_non_positive_profiled_kv_memory(monkeypatch, non_kv_cach
 
 
 def test_worker_profiles_activation_headroom_instead_of_current_residency(monkeypatch) -> None:
+    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", SimpleNamespace(empty_cache=Mock()))
     worker = object.__new__(DiffusionWorker)
     worker.rank = 0
     worker.init_snapshot = SimpleNamespace(free_memory=1200)

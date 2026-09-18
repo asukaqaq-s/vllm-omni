@@ -26,6 +26,8 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_omni.diffusion.data import (
+    DIFFUSION_REQUEST_LIFECYCLE_KEY,
+    DIFFUSION_REQUEST_STARTED,
     DiffusionOutput,
     DiffusionRequestAbortedError,
     OmniDiffusionConfig,
@@ -47,6 +49,7 @@ from vllm_omni.diffusion.output_formatter import (
     format_empty_diffusion_outputs,
     normalize_diffusion_postprocess_output,
 )
+from vllm_omni.diffusion.postprocess.media import finalize_diffusion_media
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
     get_diffusion_post_process_func,
@@ -439,8 +442,10 @@ class DiffusionEngine:
         generator = self.get_output_stream(request_id)
         async for output in generator:
             exec_total_time = time.perf_counter() - exec_start_time
+            output_ready_wait_time = 0.0
             # Async mode: wait for background D2H/SHM to complete.
             if output.async_output_id:
+                output_ready_wait_start_time = time.perf_counter()
                 fut = self.executor.wait_output_ready(output.async_output_id)
                 timeout = _async_output_timeout()
                 try:
@@ -455,6 +460,7 @@ class DiffusionEngine:
                         describe(output.async_output_id) if describe else "unavailable",
                     )
                     raise
+                output_ready_wait_time = time.perf_counter() - output_ready_wait_start_time
             postprocess_start_time = time.perf_counter()
             scheduler_metrics = diffusion_scheduler_waiting_metrics(getattr(self, "_scheduler_num_waiting_reqs", 0))
             try:
@@ -468,9 +474,11 @@ class DiffusionEngine:
             step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
             logger.debug(
                 "DiffusionEngine.step_streaming breakdown: preprocess=%.2f ms, "
-                "add_req_and_wait=%.2f ms, postprocess=%.2f ms, total=%.2f ms",
+                "add_req_and_wait=%.2f ms, output_ready_wait=%.2f ms, "
+                "postprocess=%.2f ms, total=%.2f ms",
                 preprocess_time * 1000,
                 exec_total_time * 1000,
+                output_ready_wait_time * 1000,
                 postprocess_time * 1000,
                 step_total_ms,
             )
@@ -478,6 +486,7 @@ class DiffusionEngine:
                 metrics_update = {
                     "preprocess_time_ms": preprocess_time * 1000,
                     "diffusion_engine_exec_time_ms": exec_total_time * 1000,
+                    "output_ready_wait_time_ms": output_ready_wait_time * 1000,
                     "postprocess_time_ms": postprocess_time * 1000,
                     **scheduler_metrics,
                 }
@@ -526,28 +535,40 @@ class DiffusionEngine:
                     error_type=output.error_type,
                 )
             raise RuntimeError(output.error)
-        logger.debug("Generation completed successfully.")
+        if output.request_started:
+            return format_empty_diffusion_outputs(
+                request,
+                finished=False,
+                custom_output={DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED},
+            )
 
-        if output.output is None:
-            logger.warning("Output is None, returning empty OmniRequestOutput")
-            return format_empty_diffusion_outputs(request, finished=output.finished)
-
-        # When CPU offload is enabled, move output to CPU before
-        # post-processing to avoid device OOM — model weights may still
-        # reside on the device and leave no headroom for intermediates.
-        output_data = output.output
-        if self.od_config.enable_cpu_offload:
-            output_data = _move_tensor_tree_to_cpu(output_data)
-
-        if self.post_process_func is not None:
-            # Some video pipelines need request-level controls during
-            # postprocess (for example worker-side frame interpolation).
-            postprocess_kwargs: dict[str, object] = {}
-            if self._post_process_accepts_sampling_params:
-                postprocess_kwargs["sampling_params"] = request.sampling_params
-            outputs = self.post_process_func(output_data, **postprocess_kwargs)
+        if output.media is not None:
+            if output.output is not None:
+                raise ValueError("DiffusionOutput cannot contain both media and legacy output")
+            media = output.media.to_cpu() if self.od_config.enable_cpu_offload else output.media
+            output_data = media.video.tensor
+            outputs = finalize_diffusion_media(media, sampling_params=request.sampling_params)
         else:
-            outputs = output_data
+            if output.output is None:
+                logger.warning("Output is None, returning empty OmniRequestOutput")
+                return format_empty_diffusion_outputs(request, finished=output.finished)
+
+            # When CPU offload is enabled, move output to CPU before
+            # post-processing to avoid device OOM — model weights may still
+            # reside on the device and leave no headroom for intermediates.
+            output_data = output.output
+            if self.od_config.enable_cpu_offload:
+                output_data = _move_tensor_tree_to_cpu(output_data)
+
+            if self.post_process_func is not None:
+                # Some video pipelines need request-level controls during
+                # postprocess (for example worker-side frame interpolation).
+                postprocess_kwargs: dict[str, object] = {}
+                if self._post_process_accepts_sampling_params:
+                    postprocess_kwargs["sampling_params"] = request.sampling_params
+                outputs = self.post_process_func(output_data, **postprocess_kwargs)
+            else:
+                outputs = output_data
 
         postprocess_output = normalize_diffusion_postprocess_output(outputs)
 
@@ -588,6 +609,8 @@ class DiffusionEngine:
                     self._fail_engine(exc)
                     return
                 self._scheduler_num_waiting_reqs = max(int(sched_output.num_waiting_reqs), 0)
+
+            self._emit_request_started_outputs(sched_output)
 
             if sched_output.is_empty:
                 self._emit_finished_outputs(sched_output.finished_req_ids, None)
@@ -636,6 +659,17 @@ class DiffusionEngine:
 
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
+
+    def _emit_request_started_outputs(self, sched_output: DiffusionSchedulerOutput) -> None:
+        """Notify opted-in callers when requests leave the scheduler queue."""
+        for new_req in sched_output.scheduled_new_reqs:
+            request = getattr(new_req, "req", None)
+            sampling_params = getattr(request, "sampling_params", None)
+            if getattr(sampling_params, "emit_request_lifecycle", False):
+                self._put_output(
+                    new_req.request_id,
+                    DiffusionOutput(finished=False, request_started=True),
+                )
 
     def _wait_for_admission_if_needed_locked(self) -> None:
         """Apply scheduler admission policy while holding the engine condition.

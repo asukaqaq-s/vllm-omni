@@ -23,6 +23,12 @@ One vLLM-Omni diffusion stage can load both DiTs while instantiating the
 tokenizer, processor, Qwen3-VL text encoder, video VAE, and audio VAE only
 once. Requests select the DiT with `extra_params.task`.
 
+This single-stage recipe uses the default `model_loaded.text_encoder: true` and
+`model_loaded.vae_encoder: true`. Precomputed text conditioning can replace the
+local Qwen call. Setting `model_loaded.text_encoder: false` while leaving
+`model_loaded.vae_encoder: true` requires precomputed text conditioning;
+reference media is still encoded locally.
+
 The generated MP4 contains H.264 video and synchronized stereo audio.
 
 ## Prerequisites
@@ -35,7 +41,7 @@ hf auth login
 export MODEL=MiniMaxAI/MiniMax-H3
 ```
 
-The vLLM-Omni pipeline downloads `FL2VA/**`, `Ref2VA/model_index.json`, and
+By default, the pipeline downloads `FL2VA/**`, `Ref2VA/model_index.json`, and
 `Ref2VA/transformer/**`. It does not download or load the diffusers-format
 `transformer`, `transformer_ref`, or `vae` weights at the repository root, nor
 duplicate Ref2VA copies of shared components.
@@ -869,13 +875,51 @@ balanced switch order.
 
 ### Turbo LoRA
 
-Only the native Diffusers 4-step FL2VA/T2VA v1.0 artifact is supported:
+The eight Diffusers-layout LightX2V Turbo artifacts are supported. The
+filename records the contract, so the server reads the step count, task family
+and flow shift from it and validates each request against the artifact that is
+loaded. It does not rewrite request or deploy-config sampling values: the
+request must carry that artifact's own settings, listed here, or it is
+rejected.
 
-```text
-lightx2v/Minimax-h3-Turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors
-```
+| Artifact | Task | Forwards | `num_inference_steps` | `flow_shift` | declared `alpha` |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `minimax_h3_fl2v_turbo_4step_v0.1.safetensors` | T2VA / FL2VA | 4 | 5 | 12 | none -> 8 |
+| `minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors` | T2VA / FL2VA | 4 | 5 | 6 | 128 |
+| `minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors` | T2VA / FL2VA | 4 | 5 | 6 | 128 |
+| `minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors` | T2VA / FL2VA | 4 | 5 | 6 | 8 |
+| `minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors` | T2VA / FL2VA | 8 | 9 | 12 | 8 |
+| `minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors` | T2VA / FL2VA | 8 | 9 | 6 | 8 |
+| `minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors` | Ref2VA | 4 | 5 | 12 | 8 |
+| `minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors` | Ref2VA | 8 | 9 | 6 | 8 |
 
-Download only that file:
+`audio_flow_shift` is `3.0` across the family. Each row is the complete
+published filename; use it verbatim as `TURBO_FILE` below.
+
+Alpha needs no manual compensation: the server reads it from the artifact's
+metadata, falling back to 8 with a warning for
+`minimax_h3_fl2v_turbo_4step_v0.1`, the one artifact that declares none. The
+request-level `scale` is a further multiplier on top of it.
+
+> [!NOTE]
+> Every artifact is rank 128 and the delta is applied at `scale * alpha /
+> rank`, so the `alpha=8` rows drive at 1/16 the strength of the `alpha=128`
+> rows. 8 is the default of LightX2V's reference script, which never reads the
+> metadata; its documented `v0.1` command does not override that default.
+
+Every artifact except `minimax_h3_fl2v_turbo_4step_v0.1` also ships a
+`_comfyui_` export of the same weights. Those fuse Q/K/V into one projection
+and are **not** supported; downloading one is refused by name. Take the
+Diffusers file. The filename is the contract, so do not rename an artifact
+either -- a renamed file is rejected rather than served on a guess.
+
+FL2VA artifacts serve `t2va` and `fl2va` on any FL2VA or combined server.
+Ref2VA artifacts require
+`--task-type ref2va`: a combined server serves `ref2va` from a second DiT that
+the adapter cannot bind to, so loading one there is refused rather than silently
+running an undistilled model on the few-step schedule.
+
+Download the artifact you want:
 
 ```bash
 export TURBO_DIR=/path/to/minimax-h3-turbo
@@ -884,10 +928,19 @@ hf download lightx2v/Minimax-h3-Turbo "${TURBO_FILE}" --local-dir "${TURBO_DIR}"
 export TURBO_LORA="${TURBO_DIR}/${TURBO_FILE}"
 ```
 
+`--lora-path` accepts one artifact, or a directory holding exactly one.
+
+> [!IMPORTANT]
+> This changes earlier behaviour. `--lora-path /path/to/minimax-h3-turbo`
+> pointing at a full clone of the Turbo repository used to select the v1.0 768p
+> file implicitly; a directory holding several recognized artifacts is now
+> rejected as ambiguous. Name the artifact instead:
+> `--lora-path /path/to/minimax-h3-turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors`.
+
 Start from a non-offloaded or DLO FL2VA server command and add
 `--task-type fl2va --lora-backend peft --lora-path "${TURBO_LORA}"`.
-`--lora-path` preloads the adapter; each request still activates it and uses
-the published sampling settings:
+`--lora-path` preloads the adapter; each request still activates it and must
+carry that artifact's sampling settings:
 
 ```bash
 -F 'num_inference_steps=5' \
@@ -896,14 +949,25 @@ the published sampling settings:
 -F "lora={\"name\":\"h3-turbo-v1.0\",\"path\":\"${TURBO_LORA}\",\"scale\":1.0}"
 ```
 
-For FL2VA, change `task` and add `input_reference` as shown above. The 8-step,
-ComfyUI, Ref2VA, and v1.1 artifacts are not supported. This integration is
-dynamic-only and does not support prefusion or LoRA composition. DLO is
+Switching to another FL2VA artifact means repointing `TURBO_FILE`, which moves
+both `--lora-path` and the request's `lora.path`, and carrying that row's
+`num_inference_steps` and `flow_shift`: `9` and `6` for `8step_v1.0_768p`, `9`
+and `12` for the 544p `8step_v1.0`. A request that does not match the loaded
+artifact is rejected, so a mismatch cannot silently degrade output.
+
+The two `ref2v` rows are not served by this FL2VA command. Start a
+`--task-type ref2va` server, take a request from
+[Ref2VA](#3-ref2va-image-only-imageaudio-or-mixed-references) and override
+`num_inference_steps` and `flow_shift` with that row's values; those examples
+already send `audio_flow_shift=3.0`.
+
+For FL2VA, change `task` and add `input_reference` as shown above. This
+integration is dynamic-only and does not support prefusion or LoRA composition. DLO is
 supported by keeping the request-switchable LoRA A/B buffers resident on the
 accelerator while DLO streams only the base blocks; budget for this additional
 fixed HBM usage. Model-level and standard layerwise offload remain unsupported.
-The five requested sigma points produce the four denoiser evaluations expected
-by the Turbo artifact.
+The requested sigma points always number one more than the artifact's denoiser
+evaluations.
 
 ### FlashGen native LoRA
 
@@ -1042,6 +1106,68 @@ generations move the end-to-end figure toward the denoising one. Fusing the
 adapter does not measurably change startup: weight loading took 77.3 s with it
 against 85.8 s without.
 
+### FastH3 8-Step V2 full checkpoint
+
+[FastH3 8-Step V2](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2)
+ships a full Diffusers-format transformer, including learned VSA compression
+gates. Serve the Hugging Face model ID or a downloaded snapshot directly:
+
+```bash
+export FASTH3_V2_MODEL=FastVideo/FastVideo-FastH3-8-Step-V2
+```
+
+Use a Hugging Face account with access to the release, and pin `--revision`
+when reproducing a result. The existing component loader reads its safetensors
+shards; the H3 weight loader maps names and loads Q/K/V and MLP projections into
+native parameters in memory. No conversion command or second transformer
+checkpoint is needed.
+
+The transformer and text components come from the V2 release. To retain Omni's
+native tiled and parallel VAE execution, the loader fetches only the video/audio
+VAEs from the `MiniMaxAI/MiniMax-H3` revision pinned in V2's `provenance.json`.
+Those components use the normal Hugging Face cache. No separate base-model
+argument or full base-transformer download is required. Download time is a
+preparation cost, separate from warmup and request latency.
+
+Install the optional `fastvideo-kernel` build required by the
+`FASTVIDEO_VSA` backend, including its H3 block-map entry point. A four-GPU
+configuration is:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve "${FASTH3_V2_MODEL}" --omni \
+  --host 127.0.0.1 --port 8095 --trust-remote-code --task-type fl2va \
+  --served-model-name FastH3-V2 \
+  --num-gpus 4 --usp 4 --ring 1 \
+  --vae-patch-parallel-size 4 --vae-parallel-mode tile --vae-use-tiling \
+  --diffusion-attention-backend FASTVIDEO_VSA
+
+curl --fail-with-body -sS http://127.0.0.1:8095/v1/videos/sync \
+  -F 'model=FastH3-V2' \
+  -F 'prompt=A red fox runs through fresh snow at dawn, with fast pawsteps, winter wind and distant birds.' \
+  -F 'width=1344' -F 'height=768' -F 'aspect_ratio=16:9' -F 'fps=24' \
+  -F 'num_inference_steps=8' -F 'guidance_scale=1' -F 'flow_shift=10' \
+  -F 'seed=1101' \
+  -F 'extra_params={"task":"t2va","duration":4.4,"audio_flow_shift":3.0}' \
+  -o fasth3_v2.mp4
+```
+
+V2 pins video/audio shifts **10/3**, guidance **1**, and the unshifted ladder
+`[0.999, 0.874, 0.749, 0.624, 0.5, 0.375, 0.25, 0.125, 0.0]`.
+Use **`num_inference_steps=8`** in Omni: these nine nodes bound eight model
+evaluations. FastVideo's `--steps 9` counts nodes instead. The existing H3 ODE
+update is reused without stochastic re-noising.
+
+The trained attention policy is **80% sparsity with 64-token video tiles**.
+Omni derives the number of selected video tiles from each request's geometry;
+do not supply a fixed `--fastvideo-vsa-topk`. Text/condition/audio prefix keys
+remain available to every query, and prefix queries remain dense. Missing VSA
+geometry or a failed H3 kernel raises an error instead of serving the student
+with dense attention.
+
+This release supports T2VA only, with local or pure Ulysses attention. Additional
+LoRA adapters, Ref2VA and FL2VA conditioning are unsupported. The legacy
+four-step adapter keeps its original sampling and fixed-top-k behavior.
+
 ## Key parameters
 
 | Parameter | Recommended value | Notes |
@@ -1172,25 +1298,21 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
   mode does not support `cache_backend`.
 - The first regional-compile request is a warmup and should not be included in
   steady-state performance measurements.
-- The serving path accepts fewer references than the model supports. H3 documents up
-  to 9 images, 3 video clips, and 3 audio clips (12 files) per Omni Reference
-  request; the current vLLM-Omni path takes exactly one image plus one audio
-  reference, or one or more videos with no separate `audio_reference` (it uses the
-  source soundtracks).
+- Ref2VA accepts up to 9 images, 3 video clips, and 3 audio clips, with at most
+  12 references in total. At least one image or video is required; audio-only
+  requests are rejected.
 - The 768 px short-edge mode is available for T2VA and FL2VA; 1344x768 is the
   documented 16:9 request shape.
 - `--cfg-parallel-size > 1` is rejected by design (CFG-distilled, no negative branch).
 - VAE patch parallelism requires size 1 or the full DiT group size and supports the
   H3 native `tile` mode only.
-- A U2 x Ring2 hybrid currently fails with an attention-mask length mismatch; use
-  pure Ulysses.
+- Ulysses x Ring hybrid attention supports H3's single-request contiguous suffix
+  padding. Arbitrary attention masks and multi-request packed batches remain
+  unsupported on the Ring path.
 - Online FP8 with DLO AllGather temporarily materializes the complete FP8 model
   in host memory on every rank during startup before retaining only each rank's
   shard. Size startup host memory for that transient peak.
 - TeaCache and Cache-DiT cannot be enabled on the same server.
-- Image+audio Ref2VA accepts exactly one image and one audio reference.
-- Video Ref2VA accepts one or more video files, but not an additional standalone
-  audio reference.
 - Pure Ulysses still replicates the full DiT on every rank, so smaller-memory GPUs
   cannot use `--usp N --tp 1` as a resident capacity path. Use DiT tensor parallelism
   or model-level CPU offload; text-encoder TP alone is not sufficient.
