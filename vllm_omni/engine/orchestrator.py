@@ -38,6 +38,7 @@ from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -260,10 +261,6 @@ class StreamingInputState:
         """
         segment = self.segments.get(stage_id)
         return segment if segment is not None else StreamingSegmentState()
-
-
-class NativeKVHandoffError(RuntimeError):
-    """One request lost its producer binding or transfer metadata."""
 
 
 class OrchestratorBase:

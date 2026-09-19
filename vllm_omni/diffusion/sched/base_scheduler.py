@@ -88,12 +88,7 @@ class BaseScheduler(ABC):
         self._running.clear()
         self._running_sampling_params_key = None
         self._finished_req_ids.clear()
-        self._kv_transfer_request_ids.clear()
-        self._kv_finished_request_ids.clear()
-        self._kv_loading_request_ids.clear()
-        self._kv_draining_requests.clear()
-        self._kv_received_request_ids.clear()
-        self._kv_request_generations.clear()
+        self._reset_kv_transfer_state()
         max_num_seqs = getattr(od_config, "max_num_seqs", 1)
         try:
             self.max_num_running_reqs = max(1, int(max_num_seqs))
@@ -411,6 +406,25 @@ class BaseScheduler(ABC):
         self._finish_requests({request_id: status for request_id in request_ids})
 
     def close(self) -> None:
+        self._shutdown_diffusion_kv()
+        self._request_states.clear()
+        self._waiting.clear()
+        self._running.clear()
+        self._running_sampling_params_key = None
+        self._finished_req_ids.clear()
+        self._reset_scheduler_state()
+
+    def _reset_kv_transfer_state(self) -> None:
+        """Clear request bookkeeping for native KV transfers."""
+        self._kv_transfer_request_ids.clear()
+        self._kv_finished_request_ids.clear()
+        self._kv_loading_request_ids.clear()
+        self._kv_draining_requests.clear()
+        self._kv_received_request_ids.clear()
+        self._kv_request_generations.clear()
+
+    def _shutdown_diffusion_kv(self) -> None:
+        """Stop transfers before releasing their cache and request state."""
         from vllm_omni.diffusion.diffusion_kv.kv_connector import shutdown_kv_connector
 
         shutdown_kv_connector(scheduler_connector=self._kv_connector)
@@ -418,18 +432,7 @@ class BaseScheduler(ABC):
         if self._diffusion_kv_manager is not None:
             self._diffusion_kv_manager.close()
             self._diffusion_kv_manager = None
-        self._kv_transfer_request_ids.clear()
-        self._kv_loading_request_ids.clear()
-        self._kv_draining_requests.clear()
-        self._kv_received_request_ids.clear()
-        self._kv_request_generations.clear()
-        self._request_states.clear()
-        self._kv_finished_request_ids.clear()
-        self._waiting.clear()
-        self._running.clear()
-        self._running_sampling_params_key = None
-        self._finished_req_ids.clear()
-        self._reset_scheduler_state()
+        self._reset_kv_transfer_state()
 
     def _finish_requests(
         self,

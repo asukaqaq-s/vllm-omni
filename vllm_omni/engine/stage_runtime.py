@@ -47,6 +47,7 @@ from vllm_omni.engine.stage_engine_startup import (
 from vllm_omni.engine.stage_init_utils import (
     LogicalStageInitPlan,
     ReplicaInitPlan,
+    StageMetadata,
     _inject_inferred_kv_tp_topology,
     acquire_device_locks,
     build_engine_args_dict,
@@ -625,6 +626,74 @@ class StageRuntime:
                 "pipeline with async_chunk=False"
             )
 
+    @staticmethod
+    def _prepare_replica_stage_config(
+        stage_cfg: Any,
+        *,
+        stage_id: int,
+        stage_type: str,
+        replica_id: int,
+        num_replicas: int,
+    ) -> tuple[Any, bool]:
+        """Isolate replica config and assign the native DiT KV identity."""
+        if isinstance(stage_cfg, BaseVllmOmniStageConfig):
+            native_kv = stage_cfg.connector_config.kv_transfer_config
+            if native_kv is None and isinstance(stage_cfg, VllmOmniDiffusionStageConfig):
+                native_kv = stage_cfg.diffusion_config.kv_transfer_config
+        else:
+            native_kv = (
+                stage_cfg.engine_args.get("kv_transfer_config")
+                if isinstance(stage_cfg.engine_args, Mapping)
+                else getattr(stage_cfg.engine_args, "kv_transfer_config", None)
+            )
+        # Keep the logical stage's device pool and native KV identity
+        # intact; each replica owns its config throughout startup.
+        replica_cfg = copy.deepcopy(stage_cfg) if num_replicas > 1 or native_kv else stage_cfg
+        if native_kv and stage_type == "diffusion":
+            if isinstance(replica_cfg, VllmOmniDiffusionStageConfig):
+                kv_config = (
+                    replica_cfg.connector_config.kv_transfer_config or replica_cfg.diffusion_config.kv_transfer_config
+                )
+                assert kv_config is not None
+                kv_config.engine_id = f"{kv_config.engine_id}-s{stage_id}-r{replica_id}"
+            else:
+                kv_config = replica_cfg.engine_args["kv_transfer_config"]
+                kv_config["engine_id"] = f"{kv_config['engine_id']}-s{stage_id}-r{replica_id}"
+        return replica_cfg, bool(native_kv)
+
+    @staticmethod
+    def _prepare_replica_vllm_config(
+        stage_vllm_config: Any,
+        replica_cfg: Any,
+        replica_metadata: StageMetadata,
+        *,
+        native_kv: bool,
+    ) -> Any:
+        """Assign native AR KV identity and the producer bootstrap endpoint."""
+        if not native_kv or stage_vllm_config is None:
+            return stage_vllm_config
+        replica_vllm_config = copy.deepcopy(stage_vllm_config)
+        kv_config = replica_vllm_config.kv_transfer_config
+        kv_config.engine_id = f"{kv_config.engine_id}-s{replica_metadata.stage_id}-r{replica_metadata.replica_id}"
+        if kv_config.kv_connector == "MooncakeConnector" and kv_config.kv_role == "kv_producer":
+            extra = kv_config.kv_connector_extra_config
+            port = int(extra.get("bootstrap_port", 8998)) + replica_metadata.replica_id
+            extra["bootstrap_addr"] = f"http://{kv_config.kv_ip}:{port}"
+            if isinstance(replica_cfg, BaseVllmOmniStageConfig):
+                runtime_cfg = replica_cfg.runtime_config
+                runtime_cfg.env = {
+                    **(runtime_cfg.env or {}),
+                    "VLLM_MOONCAKE_BOOTSTRAP_PORT": str(port),
+                }
+            else:
+                runtime_cfg = copy.deepcopy(replica_metadata.runtime_cfg or {})
+                runtime_cfg["env"] = {
+                    **(runtime_cfg.get("env") or {}),
+                    "VLLM_MOONCAKE_BOOTSTRAP_PORT": str(port),
+                }
+                replica_metadata.runtime_cfg = runtime_cfg
+        return replica_vllm_config
+
     def _build_logical_stage_init_plans(
         self,
         omni_transfer_config: Any,
@@ -698,30 +767,13 @@ class StageRuntime:
                 )
 
             for replica_id in range(num_replicas):
-                if isinstance(stage_cfg, BaseVllmOmniStageConfig):
-                    native_kv = stage_cfg.connector_config.kv_transfer_config
-                    if native_kv is None and isinstance(stage_cfg, VllmOmniDiffusionStageConfig):
-                        native_kv = stage_cfg.diffusion_config.kv_transfer_config
-                else:
-                    native_kv = (
-                        stage_cfg.engine_args.get("kv_transfer_config")
-                        if isinstance(stage_cfg.engine_args, Mapping)
-                        else getattr(stage_cfg.engine_args, "kv_transfer_config", None)
-                    )
-                # Keep the logical stage's device pool and native KV identity
-                # intact; each replica owns its config throughout startup.
-                replica_cfg = copy.deepcopy(stage_cfg) if num_replicas > 1 or native_kv else stage_cfg
-                if native_kv and base_metadata.stage_type == "diffusion":
-                    if isinstance(replica_cfg, VllmOmniDiffusionStageConfig):
-                        kv_config = (
-                            replica_cfg.connector_config.kv_transfer_config
-                            or replica_cfg.diffusion_config.kv_transfer_config
-                        )
-                        assert kv_config is not None
-                        kv_config.engine_id = f"{kv_config.engine_id}-s{stage_id}-r{replica_id}"
-                    else:
-                        kv_config = replica_cfg.engine_args["kv_transfer_config"]
-                        kv_config["engine_id"] = f"{kv_config['engine_id']}-s{stage_id}-r{replica_id}"
+                replica_cfg, native_kv = self._prepare_replica_stage_config(
+                    stage_cfg,
+                    stage_id=stage_id,
+                    stage_type=base_metadata.stage_type,
+                    replica_id=replica_id,
+                    num_replicas=num_replicas,
+                )
                 if stage_idx in replica_devices_map:
                     devices = replica_devices_map[stage_idx][replica_id]
                     runtime_cfg = getattr(replica_cfg, "runtime_config", getattr(replica_cfg, "runtime", None))
@@ -734,28 +786,12 @@ class StageRuntime:
                     else extract_legacy_stage_metadata(replica_cfg)
                 )
                 replica_metadata.replica_id = replica_id
-                replica_vllm_config = stage_vllm_config
-                if native_kv and stage_vllm_config is not None:
-                    replica_vllm_config = copy.deepcopy(stage_vllm_config)
-                    kv_config = replica_vllm_config.kv_transfer_config
-                    kv_config.engine_id = f"{kv_config.engine_id}-s{stage_id}-r{replica_id}"
-                    if kv_config.kv_connector == "MooncakeConnector" and kv_config.kv_role == "kv_producer":
-                        extra = kv_config.kv_connector_extra_config
-                        port = int(extra.get("bootstrap_port", 8998)) + replica_id
-                        extra["bootstrap_addr"] = f"http://{kv_config.kv_ip}:{port}"
-                        if isinstance(replica_cfg, BaseVllmOmniStageConfig):
-                            runtime_cfg = replica_cfg.runtime_config
-                            runtime_cfg.env = {
-                                **(runtime_cfg.env or {}),
-                                "VLLM_MOONCAKE_BOOTSTRAP_PORT": str(port),
-                            }
-                        else:
-                            runtime_cfg = copy.deepcopy(replica_metadata.runtime_cfg or {})
-                            runtime_cfg["env"] = {
-                                **(runtime_cfg.get("env") or {}),
-                                "VLLM_MOONCAKE_BOOTSTRAP_PORT": str(port),
-                            }
-                            replica_metadata.runtime_cfg = runtime_cfg
+                replica_vllm_config = self._prepare_replica_vllm_config(
+                    stage_vllm_config,
+                    replica_cfg,
+                    replica_metadata,
+                    native_kv=native_kv,
+                )
                 if launch_mode == "remote" and replica_metadata.stage_type != "diffusion":
                     replica_metadata.runtime_cfg = None
                 replicas.append(
