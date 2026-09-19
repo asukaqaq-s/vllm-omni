@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 from contextlib import ExitStack, contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -141,6 +142,33 @@ def test_cache_manager_registers_attention_without_adding_dense_state() -> None:
     assert isinstance(mgr, nn.Module)
     assert dict(mgr.named_modules())["attn"] is mgr.attn
     assert mgr.state_dict() == {}
+
+
+def test_cache_manager_initializes_with_quantization_skip_layers(monkeypatch):
+    import vllm_omni.diffusion.attention.layer as layer
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageKVCacheManager
+
+    config = SimpleNamespace(
+        diffusion_attention_config=None,
+        parallel_config=SimpleNamespace(ring_degree=1),
+        diffusion_kv_cache_dtype="auto",
+        diffusion_kv_cache_skip_layer_indices={3},
+    )
+    monkeypatch.setattr(layer, "get_attn_backend_for_role", lambda **_: (layer.SDPABackend, None))
+    monkeypatch.setattr(layer, "build_parallel_attention_strategy", lambda **_: object())
+    with patched_mgr_env(), set_current_diffusion_config(config):
+        # Keep the real Attention constructor and its skip-layer validation.
+        with patch(f"{_TRANSFORMER_MODULE}.Attention", layer.Attention):
+            mgr = ImageKVCacheManager(
+                num_heads=NUM_HEADS,
+                num_kv_heads=NUM_KV_HEADS,
+                head_dim=HEAD_DIM,
+                scaling=SCALING,
+                prefix="model.layers.3.self_attn",
+            )
+    assert mgr.attn.layer_idx == 3
+    assert not mgr.attn._should_apply_kv_cache_quant()
 
 
 @pytest.mark.parametrize("first_step", [True, False])

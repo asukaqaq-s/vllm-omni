@@ -934,14 +934,6 @@ class ImageKVCacheManager(nn.Module):
             # bfloat16 autocast, independent of the weight-loading dtype.
             paged_kv_cache_dtype=torch.bfloat16,
         )
-        self.dense_attn = Attention(
-            num_heads=self.num_heads,
-            head_size=self.head_dim,
-            causal=False,
-            softmax_scale=self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            prefix="",
-        )
 
     @staticmethod
     def _get_current_starts(
@@ -1246,8 +1238,7 @@ class ImageKVCacheManager(nn.Module):
                 attn_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
             )
-        attention = self.dense_attn if self.attn.is_paged_kv_active() else self.attn
-        attn_output = attention(query, key, value, attn_metadata)
+        attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
         return attn_output
 

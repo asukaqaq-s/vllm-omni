@@ -137,6 +137,55 @@ def _attach_diffusion_kv(request: OmniDiffusionRequest, *, seq_len: int = 8) -> 
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scheduler_cls", [RequestScheduler, StepScheduler])
+@pytest.mark.parametrize("failure", ["timeout", "registration"])
+async def test_single_native_kv_failure_reaches_output_stream(mocker, scheduler_cls, failure):
+    from vllm_omni.diffusion.diffusion_kv.kv_connector import KVTransferRegistrationError
+
+    scheduler = scheduler_cls()
+    _initialize_paged_scheduler(scheduler, max_num_seqs=1)
+    connector = mocker.Mock()
+    connector.get_num_new_matched_tokens.return_value = (4, True)
+    connector.request_finished.return_value = (False, None)
+    scheduler._kv_connector = connector
+    request = _make_request("failed")
+    _attach_diffusion_kv(request)
+    request.diffusion_kv_requests[0].prompt_token_ids = [1, 2, 3, 4]
+    request.kv_transfer_params = {"num_transfer_tokens": 4, "do_remote_prefill": True}
+    scheduler.add_request(request)
+    if failure == "registration":
+        mocker.patch(
+            "vllm_omni.diffusion.sched.base_scheduler.commit_kv_load",
+            side_effect=KVTransferRegistrationError("registration failed"),
+        )
+    engine = object.__new__(DiffusionEngine)
+    engine.scheduler = scheduler
+    engine.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER)
+    engine.execution_mode = (
+        DiffusionExecutionMode.STEP_BATCH if scheduler_cls is StepScheduler else DiffusionExecutionMode.REQUEST_BATCH
+    )
+    engine.abort_queue = queue.Queue()
+    engine._cv = threading.Condition()
+    engine.main_loop = asyncio.get_running_loop()
+    stream = asyncio.Queue()
+    engine._out_streams = {"failed": stream}
+    engine.executor = mocker.Mock()
+    engine.executor.prepare_kv_for_forward.return_value = KVConnectorOutput()
+    scheduled = scheduler.schedule()
+    engine._prepare_kv_for_forward(scheduled)
+    assert scheduled.scheduled_request_ids == []
+    output = BatchRunnerOutput.from_list([])
+    finished = scheduler.update_from_output(scheduled, output)
+    engine._emit_outputs(finished, scheduled.scheduled_request_ids, output)
+    terminal = await asyncio.wait_for(stream.get(), timeout=1)
+    assert terminal.finished
+    assert terminal.error == ("Timed out receiving diffusion KV" if failure == "timeout" else "registration failed")
+    assert scheduler.get_request_state("failed") is None
+    # Reporting failure must not recycle pages that the sender can still write.
+    assert scheduler._diffusion_kv_manager.has_request("failed") == (failure == "timeout")
+
+
 class _StubScheduler:
     def __init__(self, request: OmniDiffusionRequest, output) -> None:
         self._request = request
