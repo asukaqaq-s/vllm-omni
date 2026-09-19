@@ -22,6 +22,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AbortResultMessage,
@@ -34,7 +35,6 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import (
-    NativeKVHandoffError,
     Orchestrator,
     OrchestratorRequestState,
     StreamingSegmentState,
