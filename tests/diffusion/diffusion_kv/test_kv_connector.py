@@ -270,10 +270,13 @@ def test_partial_mooncake_registration_is_replaced_by_empty_notifications(cfg_re
 
     scheduler = object.__new__(MooncakeConnectorScheduler)
     scheduler.is_kv_producer = False
+    scheduler.is_kv_consumer = True
     scheduler._reqs_need_recv = {}
     connector = object.__new__(MooncakeConnector)
     connector.connector_scheduler = scheduler
     requests, manager = cfg_registration
+    for request in requests:
+        request.kv_transfer_params.update(remote_engine_id="ar", remote_bootstrap_addr="http://localhost:8998")
 
     def register(request, blocks, count):
         scheduler._reqs_need_recv[request.request_id] = (request, blocks)
@@ -286,6 +289,13 @@ def test_partial_mooncake_registration_is_replaced_by_empty_notifications(cfg_re
         commit_kv_load(connector, manager, requests, [4, 4])
     assert set(scheduler._reqs_need_recv) == {"cfg0", "cfg1"}
     assert all(blocks == [] for _, blocks in scheduler._reqs_need_recv.values())
+    metadata = scheduler.build_connector_meta(None)
+    # Even partial registration failure sends every row in one per-rank batch,
+    # preserving the producer's complete fan-out count for the shared ticket.
+    assert set(metadata.reqs_to_recv["ar"]) == {"cfg0", "cfg1"}
+    assert all(
+        meta.transfer_id == "ticket" and meta.local_block_ids == [] for meta in metadata.reqs_to_recv["ar"].values()
+    )
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), "60"])

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections import Counter
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -189,6 +190,51 @@ def prepare_kv_requests(requests: tuple[DiffusionKVRequest, ...], params: Mappin
         request.num_prompt_tokens = num_tokens
 
 
+def install_mooncake_cfg_fanout(connector: KVConnectorBase_V1) -> None:
+    """Account for multiple CFG destinations on one native Mooncake ticket.
+
+    vLLM 0.29 initializes ``need_send`` to the paired consumer rank count,
+    but increments ``sent`` per consumer request. Adapt only this producer
+    instance, after KV initialization and before serving requests. Keep the
+    upstream address planning, transport, timeout and completion code intact.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import MooncakeConnector
+
+    if not isinstance(connector, MooncakeConnector):
+        return
+    worker = connector.connector_worker
+    if worker is None or worker.is_kv_consumer or getattr(worker, "_omni_cfg_fanout_installed", False):
+        return
+    build_transfer_params = worker._build_transfer_params
+
+    async def build_with_fanout(ready_reqs, agent_meta, local_regions, remote_regions):
+        # commit_kv_load registers all rows before build_connector_meta. Thus
+        # each rank's message contains the complete row set for each ticket,
+        # including empty-block notifications. Count the full message, not
+        # just the subset whose producer-ready events fired in this iteration.
+        rows_per_ticket = Counter(transfer_id for transfer_id, _ in agent_meta.req_blocks.values())
+        tickets = {send_meta.transfer_id: send_meta for _, send_meta in ready_reqs}
+        for transfer_id, send_meta in tickets.items():
+            rows = rows_per_ticket[transfer_id]
+            previous = getattr(send_meta, "_omni_cfg_rows", None)
+            if rows < 1 or (previous is not None and previous != rows):
+                # Use the upstream transfer-error path: it decrements sending
+                # without incrementing sent, so a malformed rank cannot free
+                # source pages still needed by another rank.
+                return [], [], [], [req_id for req_id, _ in ready_reqs], "Inconsistent Mooncake CFG receive count"
+        # No await between checking and updating: all handlers run on the
+        # sender loop. The marker belongs to the ticket, not to a request-global
+        # variable; it disappears with the upstream ticket on completion/expiry.
+        for transfer_id, send_meta in tickets.items():
+            if getattr(send_meta, "_omni_cfg_rows", None) is None:
+                send_meta.need_send *= rows_per_ticket[transfer_id]
+                send_meta._omni_cfg_rows = rows_per_ticket[transfer_id]
+        return await build_transfer_params(ready_reqs, agent_meta, local_regions, remote_regions)
+
+    worker._build_transfer_params = build_with_fanout  # type: ignore[method-assign]
+    setattr(worker, "_omni_cfg_fanout_installed", True)
+
+
 def commit_kv_load(
     connector: KVConnectorBase_V1,
     manager: KVCacheManager,
@@ -197,6 +243,8 @@ def commit_kv_load(
 ) -> set[str]:
     expected = set()
     allocations = []
+    # All rows sharing a transfer_id must reach the same connector metadata:
+    # the producer uses this complete per-rank row set for fan-out accounting.
     # Validate every CFG row before mutating any connector state.
     for request, num_tokens in zip(requests, matched_tokens, strict=True):
         blocks = manager.get_blocks(request.request_id)
